@@ -21,12 +21,16 @@ func main() {
 		port        string
 		splitwise   bool
 		afd         bool
+		etcd        string
+		etcdPrefix  string
 		showVersion bool
 	)
 	flag.StringVar(&configPath, "config_path", "", "path to config file")
 	flag.StringVar(&port, "port", "", "listen port of router")
 	flag.BoolVar(&splitwise, "splitwise", false, "enable splitwise mode")
 	flag.BoolVar(&afd, "afd", false, "enable AFD mode (requires --splitwise)")
+	flag.StringVar(&etcd, "afd_topology_etcd_endpoints", "", "comma-separated etcd endpoints for AFD topology persistence")
+	flag.StringVar(&etcdPrefix, "afd_topology_etcd_prefix", "", "etcd key prefix for AFD topology persistence")
 	flag.BoolVar(&showVersion, "version", false, "print version info")
 	flag.BoolVar(&showVersion, "V", false, "print version info (shorthand)")
 	flag.Parse()
@@ -37,7 +41,7 @@ func main() {
 	}
 
 	// Load configuration
-	cfg, err := config.Load(configPath, port, splitwise, afd)
+	cfg, err := config.Load(configPath, port, splitwise, afd, etcd, etcdPrefix)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}

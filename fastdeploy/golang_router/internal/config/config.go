@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -12,6 +13,7 @@ type Config struct {
 	Log       LogConfig       `yaml:"log"`
 	Manager   ManagerConfig   `yaml:"manager"`
 	Scheduler SchedulerConfig `yaml:"scheduler"`
+	Topology  TopologyConfig  `yaml:"topology"`
 }
 
 type ServerConfig struct {
@@ -49,12 +51,17 @@ type SchedulerConfig struct {
 	StatsIntervalSecs    float64 `yaml:"stats-interval-secs"`
 }
 
+type TopologyConfig struct {
+	EtcdEndpoints []string `yaml:"etcd-endpoints"`
+	EtcdPrefix    string   `yaml:"etcd-prefix"`
+}
+
 type LogConfig struct {
 	Level  string `yaml:"level"`  // debug, info, warn, error
 	Output string `yaml:"output"` // stdout, file
 }
 
-func Load(configPath, listenPort string, isSplitwise bool, isEnableAFD bool) (*Config, error) {
+func Load(configPath, listenPort string, isSplitwise bool, isEnableAFD bool, topologyEtcdEndpoints string, topologyEtcdPrefix string) (*Config, error) {
 	var cfg Config
 	if configPath != "" {
 		data, err := os.ReadFile(configPath)
@@ -81,6 +88,15 @@ func Load(configPath, listenPort string, isSplitwise bool, isEnableAFD bool) (*C
 	}
 	if cfg.Server.AFD && !cfg.Server.Splitwise {
 		return nil, fmt.Errorf("AFD mode requires --splitwise to be enabled")
+	}
+	if topologyEtcdEndpoints != "" {
+		cfg.Topology.EtcdEndpoints = splitNonEmpty(topologyEtcdEndpoints, ",")
+	}
+	if topologyEtcdPrefix != "" {
+		cfg.Topology.EtcdPrefix = topologyEtcdPrefix
+	}
+	if cfg.Topology.EtcdPrefix == "" {
+		cfg.Topology.EtcdPrefix = "/fastdeploy/afd"
 	}
 	if cfg.Server.Mode == "" {
 		cfg.Server.Mode = "release"
@@ -143,4 +159,16 @@ func Load(configPath, listenPort string, isSplitwise bool, isEnableAFD bool) (*C
 		cfg.Scheduler.StatsIntervalSecs = 5
 	}
 	return &cfg, nil
+}
+
+func splitNonEmpty(value string, sep string) []string {
+	parts := strings.Split(value, sep)
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			result = append(result, part)
+		}
+	}
+	return result
 }

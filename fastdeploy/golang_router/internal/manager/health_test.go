@@ -153,8 +153,9 @@ func TestReadServers(t *testing.T) {
 		"worker2": {Url: "http://worker2"},
 	}
 
-	prefill, decode, mixed := ReadServers(context.Background())
+	prefill, decode, mixed, ffn := ReadServers(context.Background())
 	assert.Equal(t, []string{"http://worker1"}, prefill)
 	assert.Equal(t, []string{"http://worker2"}, decode)
 	assert.Equal(t, []string{}, mixed)
+	assert.Equal(t, []string{}, ffn)
 }

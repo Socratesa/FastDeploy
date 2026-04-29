@@ -30,6 +30,9 @@ func New(cfg *config.Config) *gin.Engine {
 	r.GET("/registered_number", manager.RegisteredNumber)
 	r.GET("/registered", manager.Registered)
 	r.GET("/health_generate", manager.HealthGenerate)
+	r.POST("/afd/expert_manifest", manager.RegisterAFDExpertManifest)
+	r.GET("/afd/topology", manager.GetAFDTopology)
+	r.GET("/afd/topology/watch", manager.WatchAFDTopology)
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	return r

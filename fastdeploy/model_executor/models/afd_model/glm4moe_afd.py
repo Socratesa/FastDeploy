@@ -16,18 +16,21 @@
 
 from __future__ import annotations
 
-import os
-import re
-from collections import defaultdict
 from types import SimpleNamespace
-from typing import Dict, List, Set
+from typing import Dict, List
 
 import paddle
 from paddle import nn
-from paddleformers.utils.log import logger
 
 from fastdeploy.config import FDConfig
 from fastdeploy.model_executor.afd import AFDDecodeRunner, AFDExpertLayout
+from fastdeploy.model_executor.afd.utils import (
+    build_afd_expert_manifest,
+    loaded_weight_sublayer_name,
+    log_loaded_weight_summary,
+    record_local_expert,
+    resolve_afd_worker_device,
+)
 from fastdeploy.model_executor.forward_meta import ForwardMeta
 from fastdeploy.model_executor.graph_optimization.decorator import (
     support_graph_optimization,
@@ -44,106 +47,6 @@ from fastdeploy.model_executor.models.glm4_moe import (
 from fastdeploy.model_executor.models.model_base import ModelForCasualLM
 
 import fastdeploy
-
-
-# ---------------------------------------------------------------------------
-#  Diagnostic helpers
-# ---------------------------------------------------------------------------
-
-def _local_device_from_config(fd_config: FDConfig) -> str:
-    """Resolve the Paddle device used by this worker process."""
-    if fd_config.device_config.device_type != "cuda":
-        return paddle.device.get_device()
-
-    selected_gpus = os.getenv("FLAGS_selected_gpus")
-    if selected_gpus:
-        selected = [gpu.strip() for gpu in selected_gpus.split(",") if gpu.strip()]
-        if len(selected) == 1:
-            return f"gpu:{selected[0]}"
-
-    device_ids = str(fd_config.parallel_config.device_ids).split(",")
-    local_rank = int(
-        os.getenv(
-            "PADDLE_LOCAL_RANK",
-            fd_config.parallel_config.data_parallel_rank * fd_config.parallel_config.tensor_parallel_size
-            + fd_config.parallel_config.tensor_parallel_rank,
-        )
-    )
-    local_device = local_rank % max(1, len(device_ids))
-    return f"gpu:{local_device}"
-
-
-def _component_name(weight_name: str) -> str:
-    if ".self_attn.q_norm." in weight_name or ".self_attn.k_norm." in weight_name:
-        return "qk_norm"
-    if ".self_attn." in weight_name:
-        return "self_attn"
-    if ".input_layernorm." in weight_name:
-        return "input_layernorm"
-    if ".post_attention_layernorm." in weight_name:
-        return "post_attention_layernorm"
-    if ".mlp.shared_experts." in weight_name:
-        return "shared_experts"
-    if ".mlp.gate.e_score_correction_bias" in weight_name:
-        return "gate_bias"
-    if ".mlp.gate." in weight_name:
-        return "gate"
-    if ".mlp.experts." in weight_name:
-        return "routed_experts"
-    if ".mlp." in weight_name:
-        return "mlp"
-    if weight_name.startswith("model.embed_tokens"):
-        return "embed_tokens"
-    if weight_name.startswith("model.norm"):
-        return "norm"
-    if weight_name.startswith("lm_head"):
-        return "lm_head"
-    return "other"
-
-
-def _layer_index(weight_name: str) -> int | None:
-    match = re.search(r"model\.layers\.(\d+)\.", weight_name)
-    if match is None:
-        return None
-    return int(match.group(1))
-
-
-def _log_actual_loaded_layers(
-    role: str,
-    loaded_names: List[str],
-    moe_layer_ids: Set[int],
-    num_layers: int,
-) -> None:
-    layer_components: Dict[int, Set[str]] = defaultdict(set)
-    global_components: Set[str] = set()
-    for weight_name in loaded_names:
-        comp = _component_name(weight_name)
-        layer_id = _layer_index(weight_name)
-        if layer_id is None:
-            global_components.add(comp)
-        else:
-            layer_components[layer_id].add(comp)
-
-    dense_count = num_layers - len(moe_layer_ids)
-    lines = [
-        "",
-        f"GLM4 AFD loaded layers summary ({role}):",
-        f"  role: {role}",
-        f"  total layers: {num_layers}",
-        f"  dense layers: {dense_count}",
-        f"  MoE layers: {len(moe_layer_ids)}",
-    ]
-
-    if global_components:
-        lines.append(f"  global components: {', '.join(sorted(global_components))}")
-
-    for layer_id in range(num_layers):
-        layer_type = "MoE" if layer_id in moe_layer_ids else "dense"
-        comps = sorted(layer_components.get(layer_id, set()))
-        comp_text = ", ".join(comps) if comps else "(no weights loaded)"
-        lines.append(f"  layer {layer_id:>3} [{layer_type:<5}] {comp_text}")
-
-    logger.info("\n".join(lines))
 
 
 # =====================================================================
@@ -164,6 +67,7 @@ class Glm4AFDAttnMoeBlock(nn.Layer):
         prefix: str,
     ) -> None:
         super().__init__()
+        self.layer_id = layer_id
         self.hidden_size = fd_config.model_config.hidden_size
         self.n_shared_experts = fd_config.model_config.n_shared_experts
 
@@ -225,7 +129,7 @@ class Glm4AFDAttnMoeBlock(nn.Layer):
 
         # --- 2. dispatch tokens to FFN workers ---
         # DeepEP dispatch/combine must use the same physical expert id space.
-        physical_topk_idx = self.afd_runner.logical_to_physical(topk_idx)
+        physical_topk_idx = self.afd_runner.logical_to_physical(topk_idx, layer_id=self.layer_id)
         recv_hidden, recv_count, handle = self.afd_runner.dispatch_physical(
             x, physical_topk_idx, topk_weights,
         )
@@ -424,7 +328,7 @@ class Glm4AFDFFNModel(nn.Layer):
         num_physical_experts: int,
     ) -> None:
         super().__init__()
-        self._device = _local_device_from_config(fd_config)
+        self._device = resolve_afd_worker_device(fd_config)
         paddle.device.set_device(self._device)
         self._afd_runner = afd_runner
         self._moe_layer_ids = moe_layer_ids
@@ -514,7 +418,7 @@ class Glm4AFDFFNModel(nn.Layer):
 class Glm4MoeForCausalLM_AFDAttn(ModelForCasualLM):
     def __init__(self, fd_config: FDConfig):
         super().__init__(fd_config)
-        self._device = _local_device_from_config(fd_config)
+        self._device = resolve_afd_worker_device(fd_config)
         paddle.device.set_device(self._device)
 
         # Initialise AFD singletons (first call creates, subsequent calls reuse)
@@ -591,10 +495,10 @@ class Glm4MoeForCausalLM_AFDAttn(ModelForCasualLM):
                 model_param_name = loaded_weight_name
 
             loaded_names.append(loaded_weight_name)
-            model_sublayer_name = re.sub(r"\.(up_gate_proj_weight|down_proj_weight|weight)$", "", model_param_name)
+            model_sublayer_name = loaded_weight_sublayer_name(model_param_name)
             process_weights_after_loading_fn(model_sublayer_name, param)
 
-        _log_actual_loaded_layers(
+        log_loaded_weight_summary(
             role="attn",
             loaded_names=loaded_names,
             moe_layer_ids=self._moe_layer_ids,
@@ -630,12 +534,14 @@ class Glm4MoeForCausalLM_AFDAttn(ModelForCasualLM):
 class Glm4MoeForCausalLM_AFDFFN(ModelForCasualLM):
     def __init__(self, fd_config: FDConfig):
         super().__init__(fd_config)
-        self._device = _local_device_from_config(fd_config)
+        self._device = resolve_afd_worker_device(fd_config)
         paddle.device.set_device(self._device)
 
         # Initialise AFD singletons (first call creates, subsequent calls reuse)
         self._afd_layout = AFDExpertLayout(fd_config.model_config.n_routed_experts)
         self._afd_runner = AFDDecodeRunner(fd_config, self._afd_layout)
+        self._afd_experts_per_rank = self._afd_layout.num_local_physical_experts
+        self._afd_local_experts_by_layer: Dict[int, Dict[int, int]] = {}
 
         num_physical = self._afd_layout.num_physical_experts
 
@@ -659,7 +565,7 @@ class Glm4MoeForCausalLM_AFDFFN(ModelForCasualLM):
             capture_sizes = [1]
 
         metas = []
-        device = _local_device_from_config(self.fd_config)
+        device = resolve_afd_worker_device(self.fd_config)
         for capture_size in capture_sizes:
             ids_remove_padding = paddle.zeros([capture_size], dtype=paddle.int64, device=device)
             forward_meta = SimpleNamespace(
@@ -730,18 +636,34 @@ class Glm4MoeForCausalLM_AFDFFN(ModelForCasualLM):
                 physical_expert_id = afd_layout.router_log2phy(expert_id)
                 param.weight_loader(param, loaded_weight, shard_id=shard_id, expert_id=physical_expert_id)
 
-                loaded_names.append(loaded_weight_name)
-                model_sublayer_name = re.sub(
-                    r"\.(up_gate_proj_weight|down_proj_weight|weight)$", "", model_param_name
+                record_local_expert(
+                    self._afd_local_experts_by_layer,
+                    loaded_weight_name,
+                    expert_id,
+                    physical_expert_id,
+                    self.fd_config.parallel_config.expert_parallel_rank,
+                    self._afd_experts_per_rank,
                 )
+
+                loaded_names.append(loaded_weight_name)
+                model_sublayer_name = loaded_weight_sublayer_name(model_param_name)
                 process_weights_after_loading_fn(model_sublayer_name, param)
                 break
 
-        _log_actual_loaded_layers(
+        log_loaded_weight_summary(
             role="ffn",
             loaded_names=loaded_names,
             moe_layer_ids=set(self._moe_layer_ids),
             num_layers=self.fd_config.model_config.num_hidden_layers,
+        )
+
+    def get_afd_expert_manifest(self) -> Dict:
+        return build_afd_expert_manifest(
+            self.fd_config,
+            self._afd_layout.afd_world_topology,
+            self.fd_config.parallel_config.expert_parallel_rank,
+            self._afd_experts_per_rank,
+            self._afd_local_experts_by_layer,
         )
 
     @paddle.no_grad()

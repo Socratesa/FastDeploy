@@ -36,6 +36,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import paddle
+import requests
 import zmq
 from tqdm import tqdm
 
@@ -67,6 +68,7 @@ from fastdeploy.inter_communicator import (
 )
 from fastdeploy.inter_communicator.fmq import FMQ
 from fastdeploy.metrics.metrics import main_process_metrics
+from fastdeploy.model_executor.afd.topology import AFDTopologyEngineService, afd_manifest_queue_name
 from fastdeploy.model_executor.guided_decoding import schema_checker
 from fastdeploy.plugins.token_processor import load_token_processor_plugins
 from fastdeploy.spec_decode import SpecMethod
@@ -157,6 +159,21 @@ class EngineService:
                 self.llm_logger.info(f"Init Cache Control Output Queue: {name} (consumer)")
                 self._ctrl_output_queues[name] = FMQ().queue(name, "consumer")
 
+        self._afd_manifest_queue = None
+        self._afd_manifest_forwarder_started = False
+        if self.cfg.afd_config.afd_role in ("attn", "ffn") and self.cfg.router_config is None:
+            raise ValueError(f"AFD {self.cfg.afd_config.afd_role} role requires router_config.")
+        if self.cfg.afd_config.afd_role == "ffn":
+            name = afd_manifest_queue_name(self.cfg.parallel_config.engine_worker_queue_port[0])
+            self.llm_logger.info(f"Init AFD expert manifest queue: {name} (consumer)")
+            self._afd_manifest_queue = FMQ().queue(name, "consumer")
+        self._afd_topology_service = None
+        if self.cfg.afd_config.afd_role == "attn" and self.cfg.router_config is not None:
+            self._afd_topology_service = AFDTopologyEngineService(
+                self.cfg.router_config.router,
+                self.cfg.parallel_config.engine_worker_queue_port[0],
+            )
+
         self.scheduler = cfg.scheduler_config.scheduler()
         self.enable_decode_cache_task = envs.FD_ENABLE_CACHE_TASK == "1"
 
@@ -246,6 +263,8 @@ class EngineService:
         self.running = True
         console_logger.debug("Start engineService...")
 
+        self._start_afd_topology_service()
+
         if self.use_async_llm:
             self.start_worker_service(async_llm_pid)
 
@@ -261,7 +280,59 @@ class EngineService:
         if self.cfg.scheduler_config.splitwise_role == "decode":
             self._decode_process_splitwise_requests()
 
+        self._start_afd_manifest_forwarder()
         self._register_manager.start()
+
+    def _start_afd_topology_service(self) -> None:
+        if self._afd_topology_service is None:
+            return
+        self.llm_logger.info("Start AFD topology engine local service.")
+        self._afd_topology_service.start()
+
+    def _start_afd_manifest_forwarder(self) -> None:
+        if self._afd_manifest_queue is None or self._afd_manifest_forwarder_started:
+            return
+        router_url = self.cfg.router_config.router if self.cfg.router_config is not None else None
+        if router_url is None:
+            raise ValueError("AFD FFN role requires router_config.router.")
+        self._afd_manifest_forwarder_started = True
+
+        def _forward_loop():
+            while True:
+                try:
+                    msg = asyncio.run(self._afd_manifest_queue.get())
+                    if msg is None:
+                        continue
+                    manifest = dict(msg.payload)
+                    register_info = getattr(self.cfg, "register_info", {}) or {}
+                    if not manifest.get("instance_url") and register_info.get("host_ip") and register_info.get("port"):
+                        manifest["instance_url"] = f"http://{register_info['host_ip']}:{register_info['port']}"
+                    while True:
+                        try:
+                            resp = requests.post(
+                                f"{router_url.rstrip('/')}/afd/expert_manifest",
+                                json=manifest,
+                                timeout=5,
+                            )
+                            if resp.ok:
+                                self.llm_logger.info(
+                                    "Forwarded AFD expert manifest to router. "
+                                    f"global_rank={manifest.get('global_rank')}, "
+                                    f"revision={resp.json().get('revision') if resp.content else 'unknown'}"
+                                )
+                                break
+                            self.llm_logger.error(
+                                "Failed to forward AFD expert manifest to router: "
+                                f"status={resp.status_code}, body={resp.text}"
+                            )
+                        except Exception as exc:
+                            self.llm_logger.error(f"Failed to forward AFD expert manifest to router: {exc}")
+                        time.sleep(2)
+                except Exception:
+                    self.llm_logger.error(f"AFD manifest forwarder failed.\n{traceback.format_exc()}")
+                    time.sleep(2)
+
+        threading.Thread(target=_forward_loop, name="afd-manifest-forwarder", daemon=True).start()
 
     def start_worker_service(self, async_llm_pid=None):
         # Initialize IPC signals for worker management
@@ -2495,7 +2566,6 @@ class EngineService:
             arguments += f" --logits-processors {' '.join(self.cfg.structured_outputs_config.logits_processors)}"
         if self.mm_max_tokens_per_item is not None:
             arguments += f" --mm_max_tokens_per_item '{json.dumps(self.mm_max_tokens_per_item)}'"
-
         worker_store_true_flag = {
             "enable_expert_parallel": self.cfg.parallel_config.enable_expert_parallel,
             "enable_prefix_caching": self.cfg.cache_config.enable_prefix_caching,

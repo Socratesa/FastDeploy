@@ -158,7 +158,7 @@ func HealthGenerate(c *gin.Context) {
 
 func RemoveServers(ctx context.Context, prefillToRemove []string, decodeToRemove []string, mixedToRemove []string, ffnToRemove []string) {
 	DefaultManager.mu.Lock()
-	defer DefaultManager.mu.Unlock()
+	removedFFNURLs := make([]string, 0, len(ffnToRemove))
 
 	for _, id := range prefillToRemove {
 		if worker, exists := DefaultManager.prefillWorkerMap[id]; exists {
@@ -181,8 +181,17 @@ func RemoveServers(ctx context.Context, prefillToRemove []string, decodeToRemove
 	for _, id := range ffnToRemove {
 		if worker, exists := DefaultManager.ffnWorkerMap[id]; exists {
 			delete(DefaultManager.ffnWorkerMap, id)
+			removedFFNURLs = append(removedFFNURLs, worker.Url)
 			logger.Error(ctx, "Removed unhealthy ffn instance: %s", worker.Url)
 		}
+	}
+	DefaultManager.mu.Unlock()
+
+	if DefaultManager.topology == nil {
+		return
+	}
+	for _, url := range removedFFNURLs {
+		DefaultManager.topology.RemoveInstance(ctx, url)
 	}
 }
 

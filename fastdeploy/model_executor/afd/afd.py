@@ -1,28 +1,14 @@
 from __future__ import annotations
 
 import os
+import threading
 from typing import Dict, List
 
 import paddle
 from paddleformers.utils.log import logger
 
+from fastdeploy.model_executor.afd.utils import resolve_afd_worker_device
 from fastdeploy.utils import singleton
-
-
-def _worker_device_from_config(fd_config) -> str:
-    """Return the logical Paddle GPU device for the current worker process."""
-    if fd_config.device_config.device_type != "cuda":
-        return paddle.device.get_device()
-
-    selected_gpus = os.getenv("FLAGS_selected_gpus")
-    if selected_gpus:
-        selected = [gpu.strip() for gpu in selected_gpus.split(",") if gpu.strip()]
-        if len(selected) == 1:
-            return f"gpu:{selected[0]}"
-
-    device_ids = str(fd_config.parallel_config.device_ids).split(",")
-    local_rank = int(os.getenv("PADDLE_LOCAL_RANK", "0"))
-    return f"gpu:{local_rank % max(1, len(device_ids))}"
 
 
 @singleton
@@ -63,8 +49,9 @@ class AFDExpertLayout:
     """Runtime logical-to-physical expert layout for AFD.
 
     Physical expert space is inflated so that every rank (including ATTN ranks)
-    has ``num_local_physical_experts`` DeepEP slots.  ATTN rank slots are
-    *phantom* (never routed to); only FFN rank slots carry real experts.
+    has ``num_local_physical_experts`` DeepEP expert positions.  ATTN-rank
+    positions are phantom (never routed to); only FFN-rank positions carry real
+    experts.
 
     Mapping formula (logical -> physical):
         ffn_rank_index  = logical_id // num_local_physical_experts
@@ -94,6 +81,9 @@ class AFDExpertLayout:
         # (one logical expert may map to multiple physical replicas in the future)
         self.log2phy: Dict[int, List[int]] = {}
         self.phy2log: List[int] = [-1] * self.num_physical_experts
+        self.log2phy_by_layer: Dict[int, Dict[int, List[int]]] = {}
+        self.phy2log_by_layer: Dict[int, List[int]] = {}
+        self._layout_lock = threading.RLock()
 
         for logical_id in range(n_routed_experts):
             ffn_rank_index = logical_id // self.num_local_physical_experts
@@ -107,7 +97,14 @@ class AFDExpertLayout:
             self.phy2log[physical_id] = logical_id
 
         self._log2phy_flat = [self.log2phy[i][0] for i in range(self.num_logical_experts)]
+        self._log2phy_flat_by_layer: Dict[int, List[int]] = {}
+        self._replica_capacity = self.num_physical_experts
+        self._log2phy_replica_matrix, self._log2phy_replica_count = self._build_replica_table(self.log2phy)
+        self._log2phy_replica_matrix_by_layer: Dict[int, List[List[int]]] = {}
+        self._log2phy_replica_count_by_layer: Dict[int, List[int]] = {}
         self._log2phy_tensor_cache: Dict[str, paddle.Tensor] = {}
+        self._log2phy_replica_tensor_cache: Dict[str, paddle.Tensor] = {}
+        self._log2phy_replica_count_tensor_cache: Dict[str, paddle.Tensor] = {}
 
         logger.info(
             f"AFDExpertLayout: logical={n_routed_experts}, "
@@ -120,17 +117,23 @@ class AFDExpertLayout:
     # ------------------------------------------------------------------
     # scalar helpers
     # ------------------------------------------------------------------
-    def router_log2phy(self, logical_expert_id: int) -> int:
+    def router_log2phy(self, logical_expert_id: int, layer_id: int | None = None) -> int:
         """Convert a single logical expert ID to physical expert ID.
 
         Currently returns the first physical replica; will support
         load-balanced selection among replicas in the future.
         """
-        return self.log2phy[logical_expert_id][0]
+        with self._layout_lock:
+            if layer_id is not None and layer_id in self.log2phy_by_layer:
+                return self.log2phy_by_layer[layer_id][logical_expert_id][0]
+            return self.log2phy[logical_expert_id][0]
 
-    def router_phy2log(self, physical_expert_id: int) -> int:
+    def router_phy2log(self, physical_expert_id: int, layer_id: int | None = None) -> int:
         """Convert a single physical expert ID to logical expert ID."""
-        return self.phy2log[physical_expert_id]
+        with self._layout_lock:
+            if layer_id is not None and layer_id in self.phy2log_by_layer:
+                return self.phy2log_by_layer[layer_id][physical_expert_id]
+            return self.phy2log[physical_expert_id]
 
     # ------------------------------------------------------------------
     # batched GPU conversion
@@ -143,27 +146,76 @@ class AFDExpertLayout:
         ``router_log2phy``).  Will be extended for multi-replica
         selection in the future.
         """
-        device = paddle.device.get_device()
-        if device not in self._log2phy_tensor_cache:
-            self._log2phy_tensor_cache[device] = paddle.to_tensor(
-                self._log2phy_flat,
-                dtype=paddle.int64,
-                place=device,
-            )
-        return self._log2phy_tensor_cache[device]
+        return self._log2phy_tensor_for_device(paddle.device.get_device(), None)
 
-    def _log2phy_tensor_for(self, tensor: paddle.Tensor) -> paddle.Tensor:
-        place = tensor.place
-        cache_key = str(place)
+    def _cache_key(self, place, layer_id: int | None) -> str:
+        layer_key = "default" if layer_id is None else str(layer_id)
+        return f"{layer_key}:{place}"
+
+    def _flat_for_layer(self, layer_id: int | None) -> List[int]:
+        if layer_id is not None and layer_id in self._log2phy_flat_by_layer:
+            return self._log2phy_flat_by_layer[layer_id]
+        return self._log2phy_flat
+
+    def _build_replica_table(self, log2phy: Dict[int, List[int]]) -> tuple[List[List[int]], List[int]]:
+        matrix: List[List[int]] = []
+        counts: List[int] = []
+        for logical_id in range(self.num_logical_experts):
+            physical_ids = log2phy[logical_id]
+            first_physical = physical_ids[0]
+            capped = physical_ids[: self._replica_capacity]
+            row = [first_physical] * self._replica_capacity
+            for replica_idx, physical_id in enumerate(capped):
+                row[replica_idx] = physical_id
+            matrix.append(row)
+            counts.append(max(1, len(capped)))
+        return matrix, counts
+
+    def _replica_table_for_layer(self, layer_id: int | None) -> List[List[int]]:
+        if layer_id is not None and layer_id in self._log2phy_replica_matrix_by_layer:
+            return self._log2phy_replica_matrix_by_layer[layer_id]
+        return self._log2phy_replica_matrix
+
+    def _replica_count_for_layer(self, layer_id: int | None) -> List[int]:
+        if layer_id is not None and layer_id in self._log2phy_replica_count_by_layer:
+            return self._log2phy_replica_count_by_layer[layer_id]
+        return self._log2phy_replica_count
+
+    def _log2phy_tensor_for_device(self, place, layer_id: int | None) -> paddle.Tensor:
+        cache_key = self._cache_key(place, layer_id)
         if cache_key not in self._log2phy_tensor_cache:
             self._log2phy_tensor_cache[cache_key] = paddle.to_tensor(
-                self._log2phy_flat,
+                self._flat_for_layer(layer_id),
                 dtype=paddle.int64,
                 place=place,
             )
         return self._log2phy_tensor_cache[cache_key]
 
-    def batch_log2phy(self, topk_idx: paddle.Tensor) -> paddle.Tensor:
+    def _log2phy_tensor_for(self, tensor: paddle.Tensor, layer_id: int | None = None) -> paddle.Tensor:
+        with self._layout_lock:
+            return self._log2phy_tensor_for_device(tensor.place, layer_id)
+
+    def _replica_tensors_for_device(self, place, layer_id: int | None) -> tuple[paddle.Tensor, paddle.Tensor]:
+        cache_key = self._cache_key(place, layer_id)
+        if cache_key not in self._log2phy_replica_tensor_cache:
+            self._log2phy_replica_tensor_cache[cache_key] = paddle.to_tensor(
+                self._replica_table_for_layer(layer_id),
+                dtype=paddle.int64,
+                place=place,
+            )
+        if cache_key not in self._log2phy_replica_count_tensor_cache:
+            self._log2phy_replica_count_tensor_cache[cache_key] = paddle.to_tensor(
+                self._replica_count_for_layer(layer_id),
+                dtype=paddle.int64,
+                place=place,
+            )
+        return self._log2phy_replica_tensor_cache[cache_key], self._log2phy_replica_count_tensor_cache[cache_key]
+
+    def _replica_tensors_for(self, tensor: paddle.Tensor, layer_id: int | None = None) -> tuple[paddle.Tensor, paddle.Tensor]:
+        with self._layout_lock:
+            return self._replica_tensors_for_device(tensor.place, layer_id)
+
+    def batch_log2phy(self, topk_idx: paddle.Tensor, layer_id: int | None = None) -> paddle.Tensor:
         """Vectorised logical -> physical conversion for a routing tensor.
 
         Args:
@@ -174,9 +226,85 @@ class AFDExpertLayout:
         if topk_idx.shape[0] == 0:
             return topk_idx
         orig_shape = topk_idx.shape
-        return paddle.index_select(
-            self._log2phy_tensor_for(topk_idx), topk_idx.reshape([-1]), axis=0
-        ).reshape(orig_shape)
+        flat_logical = topk_idx.reshape([-1])
+        replica_table, replica_count = self._replica_tensors_for(topk_idx, layer_id)
+        selected_counts = paddle.index_select(replica_count, flat_logical, axis=0)
+        replica_selector = paddle.arange(flat_logical.shape[0], dtype=paddle.int64)
+        replica_idx = paddle.remainder(replica_selector, selected_counts)
+        gather_idx = paddle.stack([flat_logical, replica_idx], axis=1)
+        return paddle.gather_nd(replica_table, gather_idx).reshape(orig_shape)
+
+    def update_from_topology_snapshot(self, snapshot: dict) -> None:
+        """Apply a router-generated ready topology snapshot.
+
+        The shape of DeepEP's physical expert space is fixed for v1, so only
+        snapshots matching the bootstrap physical size are applied.
+        """
+        layouts = snapshot.get("expert_layout_by_layer") or []
+        if not layouts:
+            logger.warning("AFD topology snapshot has no expert_layout_by_layer; skip update.")
+            return
+
+        updated_layers = []
+        with self._layout_lock:
+            for layer_layout in layouts:
+                layer_id = int(layer_layout["layer_id"])
+                phy2log = [int(v) for v in layer_layout.get("phy2log", [])]
+                if len(phy2log) != self.num_physical_experts:
+                    logger.warning(
+                        "AFD topology layer has incompatible physical size; skip. "
+                        f"layer={layer_id}, got={len(phy2log)}, expected={self.num_physical_experts}"
+                    )
+                    continue
+
+                log2phy: Dict[int, List[int]] = {i: [] for i in range(self.num_logical_experts)}
+                for physical_id, logical_id in enumerate(phy2log):
+                    if logical_id < 0:
+                        continue
+                    if logical_id >= self.num_logical_experts:
+                        logger.warning(
+                            "AFD topology layer has invalid logical expert id; skip entry. "
+                            f"layer={layer_id}, physical={physical_id}, logical={logical_id}"
+                        )
+                        continue
+                    log2phy[logical_id].append(physical_id)
+
+                missing = [logical_id for logical_id, physical_ids in log2phy.items() if not physical_ids]
+                if missing:
+                    logger.warning(
+                        "AFD topology layer misses logical experts; keep previous layer layout. "
+                        f"layer={layer_id}, missing_count={len(missing)}, sample={missing[:8]}"
+                    )
+                    continue
+
+                flat = [log2phy[i][0] for i in range(self.num_logical_experts)]
+                replica_matrix, replica_count = self._build_replica_table(log2phy)
+                self.log2phy_by_layer[layer_id] = log2phy
+                self.phy2log_by_layer[layer_id] = phy2log
+                self._log2phy_flat_by_layer[layer_id] = flat
+                self._log2phy_replica_matrix_by_layer[layer_id] = replica_matrix
+                self._log2phy_replica_count_by_layer[layer_id] = replica_count
+                updated_layers.append(layer_id)
+
+                for cache_key, cached in list(self._log2phy_tensor_cache.items()):
+                    if not cache_key.startswith(f"{layer_id}:"):
+                        continue
+                    cached.set_value(paddle.to_tensor(flat, dtype=paddle.int64, place=cached.place))
+                for cache_key, cached in list(self._log2phy_replica_tensor_cache.items()):
+                    if not cache_key.startswith(f"{layer_id}:"):
+                        continue
+                    cached.set_value(paddle.to_tensor(replica_matrix, dtype=paddle.int64, place=cached.place))
+                for cache_key, cached in list(self._log2phy_replica_count_tensor_cache.items()):
+                    if not cache_key.startswith(f"{layer_id}:"):
+                        continue
+                    cached.set_value(paddle.to_tensor(replica_count, dtype=paddle.int64, place=cached.place))
+
+        if updated_layers:
+            logger.info(
+                "AFDExpertLayout updated from topology snapshot: "
+                f"revision={snapshot.get('revision')}, layers={updated_layers[:8]}, "
+                f"num_layers={len(updated_layers)}"
+            )
 
 
 @singleton
@@ -193,7 +321,7 @@ class AFDDecodeRunner:
         from fastdeploy.model_executor.layers.moe.ep import DeepEPEngine
 
         self.fd_config = fd_config
-        self.device = _worker_device_from_config(fd_config)
+        self.device = resolve_afd_worker_device(fd_config)
         self._device_touch_tensor = None
         paddle.device.set_device(self.device)
         self._ensure_device("init")
@@ -263,10 +391,10 @@ class AFDDecodeRunner:
             f"PADDLE_LOCAL_RANK={os.getenv('PADDLE_LOCAL_RANK')}"
         )
 
-    def logical_to_physical(self, topk_idx: paddle.Tensor) -> paddle.Tensor:
+    def logical_to_physical(self, topk_idx: paddle.Tensor, layer_id: int | None = None) -> paddle.Tensor:
         """Convert router logical expert IDs to AFD physical expert IDs."""
         self._ensure_device("logical_to_physical")
-        return self.afd_layout.batch_log2phy(topk_idx)
+        return self.afd_layout.batch_log2phy(topk_idx, layer_id=layer_id)
 
     def dispatch_physical(self, x, physical_topk_idx, topk_weights, **kwargs):
         """Low-latency dispatch via DeepEP using physical expert IDs."""
@@ -289,7 +417,7 @@ class AFDDecodeRunner:
 
     def dispatch(self, x, topk_idx, topk_weights, **kwargs):
         """Low-latency dispatch via DeepEP using logical expert IDs."""
-        physical_topk_idx = self.logical_to_physical(topk_idx)
+        physical_topk_idx = self.logical_to_physical(topk_idx, layer_id=kwargs.pop("layer_id", None))
         return self.dispatch_physical(x, physical_topk_idx, topk_weights, **kwargs)
 
     def combine(self, ffn_out, physical_topk_idx, topk_weights, handle, **kwargs):

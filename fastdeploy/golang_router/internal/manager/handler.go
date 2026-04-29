@@ -18,6 +18,7 @@ type Manager struct {
 	ffnWorkerMap     map[string]*WorkerInfo // ffnWorkerMap holds FFN workers (AFD only).
 	splitwise        bool
 	afd              bool
+	topology         *AFDTopologyManager
 	mu               sync.RWMutex
 }
 
@@ -50,6 +51,9 @@ func Init(cfg *config.Config) {
 		ffnWorkerMap:     make(map[string]*WorkerInfo),
 		splitwise:        cfg.Server.Splitwise,
 		afd:              cfg.Server.AFD,
+	}
+	if cfg.Server.AFD {
+		manager.topology = NewAFDTopologyManager(cfg)
 	}
 	DefaultManager = manager
 	// Define a default timeout duration

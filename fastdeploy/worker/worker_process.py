@@ -25,7 +25,8 @@ from typing import List, Tuple
 import numpy as np
 
 from fastdeploy.logger.logger import intercept_paddle_loggers
-from fastdeploy.model_executor.afd.afd import AFDWorldTopology
+from fastdeploy.model_executor.afd.afd import AFDExpertLayout, AFDWorldTopology
+from fastdeploy.model_executor.afd.topology import AFDTopologyWorkerClient, send_afd_expert_manifest_to_engine
 
 with intercept_paddle_loggers():
     import paddle
@@ -872,7 +873,25 @@ class PaddleDisWorkerProc:
                 paddle.distributed.barrier(self.parallel_config.tp_group)
             else:
                 paddle.distributed.barrier()
+        self._report_afd_expert_manifest()
         self.loaded_model_signal.value[0] = 1
+
+    def _report_afd_expert_manifest(self) -> None:
+        if self.fd_config.afd_config.afd_role != "ffn":
+            return
+        model = self.worker.get_model()
+        if not hasattr(model, "get_afd_expert_manifest"):
+            logger.info("Skip AFD expert manifest reporting because model does not expose manifest.")
+            return
+        try:
+            manifest = model.get_afd_expert_manifest()
+            send_afd_expert_manifest_to_engine(manifest, self.parallel_config.engine_pid)
+            logger.info(
+                "Sent AFD expert manifest to engine. "
+                f"global_rank={manifest.get('global_rank')}, layers={len(manifest.get('layers', []))}"
+            )
+        except Exception:
+            logger.error(f"Failed to send AFD expert manifest to engine.\n{traceback.format_exc()}")
 
     def run_control_method(self, control_request: ControlRequest) -> None:
         logger.info(f"Global rank: {self.global_rank}, Local rank: {self.local_rank} start to run control request: {control_request}")
@@ -1477,6 +1496,19 @@ def run_worker_proc() -> None:
     worker_proc.load_model()
     # Initialize KV Cache
     worker_proc.initialize_kv_cache()
+
+    if fd_config.afd_config.afd_role == "attn":
+        try:
+            topology_client = AFDTopologyWorkerClient(
+                fd_config.parallel_config.engine_pid,
+                global_rank,
+                AFDExpertLayout(),
+            )
+            topology_client.start(block_until_ready=True)
+            worker_proc.afd_topology_client = topology_client
+            logger.info("Started AFD topology watcher from engine local IPC.")
+        except Exception:
+            logger.error(f"Failed to start AFD topology watcher.\n{traceback.format_exc()}")
 
     # Trigger CUDAGraph capture
     worker_proc.graph_optimize_and_warm_up_model()
