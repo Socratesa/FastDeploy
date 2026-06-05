@@ -24,14 +24,9 @@ import requests
 
 from fastdeploy.config import FDConfig
 from fastdeploy.eplb.async_expert_loader import load_model_weights_process
-from fastdeploy.eplb.afd_utils import (
-    build_afd_redundant_expert_tables,
-    get_afd_expert_layout_sizes,
-)
 from fastdeploy.eplb.eplb import rebalance_experts
 from fastdeploy.eplb.utils import RedundantExpertWorkload
 from fastdeploy.inter_communicator import IPCSignal, RearrangeExpertStatus
-from fastdeploy.model_executor.afd import AFDWorldTopology
 from fastdeploy.utils import get_logger
 
 
@@ -61,25 +56,16 @@ class RedundantExpertManager:
         self.ipc_signal_suffix = ipc_signal_suffix
         self.local_rank = self.rank % self.fd_config.parallel_config.tensor_parallel_size
 
-        self._afd_world_topology = None
-        if self.fd_config.afd_config.enable_afd:
-            self._afd_world_topology = AFDWorldTopology()
         self._is_afd_attn = self.fd_config.afd_config.enable_afd and self.fd_config.afd_config.afd_role == "attn"
 
-        if self._afd_world_topology is None:
+        if not self.fd_config.afd_config.enable_afd:
             self.num_replicas = self.num_logical_experts + self.num_redundant_experts
             self.num_nodes = max(ep_size // 8, 1)
             self.num_gpus = ep_size
         else:
-            _, _, global_physical_experts = get_afd_expert_layout_sizes(
-                num_logical_experts=self.num_logical_experts,
-                redundant_experts_num=self.num_redundant_experts,
-                world_size=self._afd_world_topology.world_size,
-                ffn_ranks=self._afd_world_topology.ffn_ranks,
-            )
-            self.num_replicas = global_physical_experts
-            self.num_nodes = max(len(self._afd_world_topology.ffn_ranks) // 8, 1)
-            self.num_gpus = len(self._afd_world_topology.ffn_ranks)
+            self.num_replicas = self.fd_config.afd_config.afd_num_physical_experts
+            self.num_nodes = max(len(self.fd_config.afd_config.afd_ffn_ranks) // 8, 1)
+            self.num_gpus = len(self.fd_config.afd_config.afd_ffn_ranks)
         self.num_groups = self.num_logical_experts
         self.expert_per_rank = self.num_replicas // ep_size
         assert (
@@ -133,7 +119,7 @@ class RedundantExpertManager:
         self.model_tokens_per_expert_stats_list = np.ones(
             (self.num_hidden_layers, self.num_logical_experts), dtype=np.int32
         )
-        self.caculate_expert_rank_table(True)
+        self.calculate_expert_rank_table(True)
 
         self.dp_rank_address = None
         self.need_allgather_load_weight_result = False
@@ -301,7 +287,7 @@ class RedundantExpertManager:
             if signal_update_weight_from_disk_array.value[0] == 1:
                 # step 2. async load weight: disk -> memory
                 self.model_tokens_per_expert_stats_list[:] = shm_all_experts_token_stats.value[:]
-                self.caculate_expert_rank_table()
+                self.calculate_expert_rank_table()
                 if self._is_afd_attn:
                     self.update_weight_from_disk_result.value[0] = 1
                 else:
@@ -309,9 +295,9 @@ class RedundantExpertManager:
                 signal_update_weight_from_disk_array.value[0] = 0
             time.sleep(0.5)
 
-    def caculate_expert_rank_table(self, is_init=False):
+    def calculate_expert_rank_table(self, is_init=False):
         """
-        caculate_expert_rank_table
+        calculate_expert_rank_table
         """
         num_groups = self.num_groups
         num_nodes = self.num_nodes
@@ -320,31 +306,19 @@ class RedundantExpertManager:
         if is_init:
             num_groups = 1
             eplb_strategy = ""
-            if self._afd_world_topology is None:
+            if not self.fd_config.afd_config.enable_afd:
                 num_nodes = 8
                 num_gpus = 8 * 8
         # eplb
-        if self._afd_world_topology is None:
-            rank_expert_list, logical_to_physical_map, expert_count = rebalance_experts(
-                self.model_tokens_per_expert_stats_list,
-                self.num_replicas,
-                num_groups,
-                num_nodes,
-                num_gpus,
-                eplb_strategy,
-            )
-        else:
-            rank_expert_list, logical_to_physical_map, expert_count = build_afd_redundant_expert_tables(
-                weight=self.model_tokens_per_expert_stats_list,
-                num_replicas=self.num_replicas,
-                world_size=self._afd_world_topology.world_size,
-                ffn_ranks=self._afd_world_topology.ffn_ranks,
-                redundant_experts_num=self.num_redundant_experts,
-                num_groups=num_groups,
-                num_nodes=num_nodes,
-                num_gpus=num_gpus,
-                eplb_strategy=eplb_strategy,
-            )
+        rank_expert_list, logical_to_physical_map, expert_count = rebalance_experts(
+            weight=self.model_tokens_per_expert_stats_list,
+            num_replicas=self.num_replicas,
+            num_groups=num_groups,
+            num_nodes=num_nodes,
+            num_gpus=num_gpus,
+            eplb_strategy=eplb_strategy,
+            fd_config=self.fd_config,
+        )
 
         # backup info
         self.last_model_ep_rank_to_expert_id_list[:] = self.model_ep_rank_to_expert_id_list[:]

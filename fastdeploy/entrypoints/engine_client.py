@@ -903,10 +903,7 @@ class EngineClient:
                 status_code = HTTPStatus.OK
             return content, status_code
         elif action == "update_weight_from_tensor":
-            afd_config = getattr(self.fd_config, "afd_config", None)
-            is_afd_controller_update = (
-                getattr(afd_config, "enable_afd", False) is True and request_dict.get("from_controller", False)
-            )
+            is_afd_controller_update = self.fd_config.afd_config.enable_afd and request_dict.get("from_controller", False)
             if (
                 self.fd_config.scheduler_config.splitwise_role != "prefill"
                 and not is_afd_controller_update

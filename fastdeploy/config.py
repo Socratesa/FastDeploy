@@ -787,6 +787,17 @@ class AFDConfig:
         self.afd_nnodes: int = 1
         self.afd_nnode_rank: int = 0
         self.afd_node_srank: int = afd_node_srank
+        self.afd_attn_ranks: list[int] = []
+        self.afd_ffn_ranks: list[int] = []
+        self.afd_world_size: int = 1
+        self.afd_num_attn_ranks: int = 0
+        self.afd_num_ffn_ranks: int = 0
+        self.afd_num_logical_experts: int = 0
+        self.afd_redundant_experts_num: int = 0
+        self.afd_num_ffn_physical_experts: int = 0
+        self.afd_num_local_physical_experts: int = 0
+        self.afd_num_physical_experts: int = 0
+        self.afd_static_log2phy: list[int] = []
 
         if args is not None:
             for key, value in args.items():
@@ -796,6 +807,42 @@ class AFDConfig:
     @property
     def enable_afd(self) -> bool:
         return self.afd_role is not None
+
+    def set_rank_topology(self, world_size: int, attn_ranks: list[int], ffn_ranks: list[int]) -> None:
+        if not attn_ranks:
+            raise ValueError("AFD requires at least one ATTN rank.")
+        if not ffn_ranks:
+            raise ValueError("AFD requires at least one FFN rank.")
+
+        self.afd_attn_ranks = sorted(int(rank) for rank in attn_ranks)
+        self.afd_ffn_ranks = sorted(int(rank) for rank in ffn_ranks)
+        self.afd_world_size = int(world_size)
+        self.afd_num_attn_ranks = len(self.afd_attn_ranks)
+        self.afd_num_ffn_ranks = len(self.afd_ffn_ranks)
+
+    def set_expert_layout(self, num_logical_experts: int, num_redundant_experts: int = 0) -> None:
+        self.afd_num_logical_experts = num_logical_experts
+        self.afd_num_redundant_experts = num_redundant_experts
+        self.afd_num_ffn_physical_experts = num_logical_experts + num_redundant_experts
+
+        if self.afd_num_ffn_physical_experts % self.afd_num_ffn_ranks != 0:
+            raise ValueError(
+                "AFD requires logical + redundant experts to be divisible by FFN ranks: "
+                f"num_logical_experts={num_logical_experts}, "
+                f"redundant_experts_num={num_redundant_experts}, "
+                f"ffn_ranks={self.afd_ffn_ranks}"
+            )
+        
+        self.afd_num_local_physical_experts = self.afd_num_ffn_physical_experts // self.afd_num_ffn_ranks
+        self.afd_num_physical_experts = self.afd_num_local_physical_experts * self.afd_world_size
+        
+        
+        self.afd_static_log2phy = []
+        for logical_id in range(num_logical_experts):
+            ffn_rank_index = logical_id // self.afd_num_local_physical_experts
+            ffn_global_rank = self.afd_ffn_ranks[ffn_rank_index]
+            local_offset = logical_id % self.afd_num_local_physical_experts
+            self.afd_static_log2phy.append(ffn_global_rank * self.afd_num_local_physical_experts + local_offset)
 
     def print(self):
         logger.info("AFD Configuration Information :")

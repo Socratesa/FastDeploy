@@ -25,7 +25,6 @@ from typing import List, Tuple
 import numpy as np
 
 from fastdeploy.logger.logger import intercept_paddle_loggers
-from fastdeploy.model_executor.afd.afd import AFDWorldTopology
 
 with intercept_paddle_loggers():
     import paddle
@@ -140,9 +139,6 @@ def init_distributed_environment(seed: int = 20) -> Tuple[int, int]:
         init_mooncake_pg(world_size, global_rank, ib_device_filter=ib_devices, clean_existed_groups=True, logger=logger)
 
     return world_size, global_rank
-
-def init_afd_environment(world_size: int, attn_ranks: List[int], ffn_ranks: List[int]):
-    AFDWorldTopology(world_size, attn_ranks, ffn_ranks)
 
 
 def collect_afd_rank_info(args, world_size: int, global_rank: int) -> Tuple[int, int, List[int], List[int], int]:
@@ -1300,6 +1296,8 @@ def initialize_fd_config(
     global_rank: int = 0,
     local_rank: int = 0,
     afd_node_srank: int = 0,
+    afd_attn_ranks: List[int] | None = None,
+    afd_ffn_ranks: List[int] | None = None,
 ) -> FDConfig:
     """Initialize FDConfig from either RolloutModelConfig or argparse.Namespace
 
@@ -1319,6 +1317,15 @@ def initialize_fd_config(
     scheduler_config = SchedulerConfig(vars(args))
     eplb_config = EPLBConfig(args.eplb_config)
     afd_config = AFDConfig(vars(args), afd_node_srank)
+    if afd_config.enable_afd:
+        afd_config.set_rank_topology(world_size, afd_attn_ranks or [], afd_ffn_ranks or [])
+        num_logical_experts = (
+            model_config.moe_num_experts[0]
+            if isinstance(model_config.moe_num_experts, list)
+            else model_config.moe_num_experts
+        )
+        num_redundant_experts = eplb_config.redundant_experts_num if eplb_config.enable_eplb else 0
+        afd_config.set_expert_layout(num_logical_experts, num_redundant_experts)
 
     parallel_config.tensor_parallel_rank = local_rank % parallel_config.tensor_parallel_size
     parallel_config.data_parallel_rank = local_rank // parallel_config.tensor_parallel_size
@@ -1331,13 +1338,16 @@ def initialize_fd_config(
     # config for EP, may be need change
     if parallel_config.expert_parallel_size > 1:
         expert_parallel_rank = global_rank if afd_config.enable_afd else local_rank % parallel_config.expert_parallel_size
-        if isinstance(model_config.moe_num_experts, list):
-            num_experts = model_config.moe_num_experts[0] + eplb_config.redundant_experts_num
-        elif hasattr(model_config, "num_local_experts") and model_config.num_local_experts is not None:
-            num_experts = model_config.num_local_experts + eplb_config.redundant_experts_num
+        if afd_config.enable_afd:
+            num_experts_per_rank = afd_config.afd_num_local_physical_experts
         else:
-            num_experts = model_config.moe_num_experts + eplb_config.redundant_experts_num
-        num_experts_per_rank = num_experts // parallel_config.expert_parallel_size
+            if isinstance(model_config.moe_num_experts, list):
+                num_experts = model_config.moe_num_experts[0] + eplb_config.redundant_experts_num
+            elif hasattr(model_config, "num_local_experts") and model_config.num_local_experts is not None:
+                num_experts = model_config.num_local_experts + eplb_config.redundant_experts_num
+            else:
+                num_experts = model_config.moe_num_experts + eplb_config.redundant_experts_num
+            num_experts_per_rank = num_experts // parallel_config.expert_parallel_size
         num_experts_start_offset = expert_parallel_rank * num_experts_per_rank
         parallel_config.expert_parallel_rank = expert_parallel_rank
         parallel_config.num_experts_per_rank = num_experts_per_rank
@@ -1465,6 +1475,8 @@ def run_worker_proc() -> None:
     local_rank = global_rank
     ranks = world_size
     afd_node_srank = 0
+    attn_ranks = []
+    ffn_ranks = []
     
     if args.afd_role is not None:
         ranks, local_rank, attn_ranks, ffn_ranks, afd_node_srank = collect_afd_rank_info(args, world_size, global_rank)
@@ -1477,11 +1489,9 @@ def run_worker_proc() -> None:
         global_rank=global_rank,
         local_rank=local_rank,
         afd_node_srank=afd_node_srank,
+        afd_attn_ranks=attn_ranks,
+        afd_ffn_ranks=ffn_ranks,
     )
-
-    # init AFD environment
-    if fd_config.afd_config.enable_afd:
-        init_afd_environment(world_size, attn_ranks, ffn_ranks)
 
     # Create worker process
     if current_platform.is_iluvatar():

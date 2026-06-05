@@ -213,7 +213,7 @@ def rebalance_experts_hierarchical(
     return pphy2log, pphyrank, logcnt
 
 
-def rebalance_experts(
+def _rebalance_experts(
     weight: np.ndarray,
     num_replicas: int,
     num_groups: int,
@@ -256,6 +256,90 @@ def rebalance_experts(
         axis=1,
     )
     return phy2log, log2phy, logcnt
+
+
+def rebalance_experts(
+    weight: np.ndarray,
+    num_replicas: int,
+    num_groups: int,
+    num_nodes: int,
+    num_gpus: int,
+    eplb_strategy: str = "",
+    fd_config=None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    afd_config = fd_config.afd_config
+    if afd_config is None or not afd_config.enable_afd:
+        return _rebalance_experts(
+            weight,
+            num_replicas,
+            num_groups,
+            num_nodes,
+            num_gpus,
+            eplb_strategy,
+        )
+
+    if weight.ndim != 2:
+        raise ValueError(f"weight must be [layers, logical_experts], got shape={weight.shape}")
+
+    num_layers, num_logical_experts = weight.shape
+    if num_logical_experts != afd_config.afd_num_logical_experts:
+        raise ValueError(
+            "AFD EPLB weight shape does not match config: "
+            f"weight_logical_experts={num_logical_experts}, "
+            f"config_logical_experts={afd_config.afd_num_logical_experts}"
+        )
+    if afd_config.afd_num_redundant_experts < 0:
+        raise ValueError(f"AFD redundant experts must be non-negative, got {afd_config.afd_num_redundant_experts}")
+
+    ffn_ranks = afd_config.afd_ffn_ranks
+    ffn_replicas = afd_config.afd_num_ffn_physical_experts
+    local_physical_experts = afd_config.afd_num_local_physical_experts
+    global_physical_experts = afd_config.afd_num_physical_experts
+    if ffn_replicas != num_logical_experts + afd_config.afd_num_redundant_experts:
+        raise ValueError(
+            "AFD EPLB config layout is inconsistent: "
+            f"ffn_replicas={ffn_replicas}, logical={num_logical_experts}, "
+            f"redundant={afd_config.afd_num_redundant_experts}"
+        )
+    if num_replicas != global_physical_experts:
+        raise ValueError(
+            "AFD num_replicas must match global physical expert slots: "
+            f"num_replicas={num_replicas}, expected={global_physical_experts}"
+        )
+
+    ffn_phy2log, ffn_log2phy, expert_count = _rebalance_experts(
+        weight,
+        ffn_replicas,
+        num_groups,
+        num_nodes,
+        num_gpus,
+        eplb_strategy,
+    )
+
+    global_phy2log = np.full((num_layers, global_physical_experts), -1, dtype=np.int32)
+    for ffn_rank_index, global_rank in enumerate(ffn_ranks):
+        ffn_start = ffn_rank_index * local_physical_experts
+        ffn_end = ffn_start + local_physical_experts
+        global_start = global_rank * local_physical_experts
+        global_end = global_start + local_physical_experts
+        global_phy2log[:, global_start:global_end] = ffn_phy2log[:, ffn_start:ffn_end]
+
+    max_replicas = afd_config.afd_num_redundant_experts + 1
+    global_log2phy = np.full((num_layers, num_logical_experts, max_replicas), -1, dtype=np.int32)
+    mapped_log2phy = np.full_like(ffn_log2phy, -1, dtype=np.int32)
+    valid = ffn_log2phy >= 0
+    if np.any(valid):
+        ffn_rank_indexes = ffn_log2phy[valid] // local_physical_experts
+        local_offsets = ffn_log2phy[valid] % local_physical_experts
+        ffn_rank_array = np.asarray(ffn_ranks, dtype=np.int32)
+        mapped_log2phy[valid] = ffn_rank_array[ffn_rank_indexes] * local_physical_experts + local_offsets
+    if mapped_log2phy.shape[-1] > max_replicas:
+        raise ValueError(
+            "AFD EPLB generated more replicas per logical expert than expected: "
+            f"actual={mapped_log2phy.shape[-1]}, max={max_replicas}"
+        )
+    global_log2phy[:, :, : mapped_log2phy.shape[-1]] = mapped_log2phy
+    return global_phy2log, global_log2phy, expert_count
 
 
 __all__ = ["rebalance_experts"]

@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from .afd import AFDA2ABackendBase, AFDExpertLayout
+from .afd import AFDA2ABackendBase
 
 
 class AFDDeepEPA2ABackend(AFDA2ABackendBase):
@@ -22,15 +22,15 @@ class AFDDeepEPA2ABackend(AFDA2ABackendBase):
 
     name = "deepep"
 
-    def __init__(self, fd_config, afd_layout: AFDExpertLayout):
+    def __init__(self, fd_config):
         from fastdeploy.config import MoEPhase
         from fastdeploy.model_executor.layers.moe.ep_deepep_backend import DeepEPEngine
 
         self.ep_engine = DeepEPEngine(
             num_max_dispatch_tokens_per_rank=fd_config.model_config.num_max_dispatch_tokens_per_rank,
             hidden_size=fd_config.model_config.hidden_size,
-            num_experts=afd_layout.num_physical_experts,
-            ep_size=afd_layout.world_size,
+            num_experts=fd_config.afd_config.afd_num_physical_experts,
+            ep_size=fd_config.afd_config.afd_world_size,
             ep_rank=fd_config.parallel_config.expert_parallel_rank,
             splitwise_role=fd_config.scheduler_config.splitwise_role,
             moe_phase=MoEPhase("decode"),
@@ -62,9 +62,3 @@ class AFDDeepEPA2ABackend(AFDA2ABackendBase):
         if combine_hook is not None:
             combine_hook()
         return combined
-
-    def runtime_device_info(self):
-        try:
-            return self.ep_engine.deepep_engine.runtime.get_local_device_id()
-        except Exception as exc:  # pragma: no cover - diagnostic only
-            return f"unavailable: {exc}"

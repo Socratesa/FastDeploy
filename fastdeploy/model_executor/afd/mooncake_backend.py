@@ -12,14 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import annotations
-
-import os
-
 import paddle
-from paddleformers.utils.log import logger
 
-from .afd import AFDA2ABackendBase, AFDExpertLayout
+from .afd import AFDA2ABackendBase
 
 
 class AFDMooncakeM2NA2ABackend(AFDA2ABackendBase):
@@ -27,7 +22,7 @@ class AFDMooncakeM2NA2ABackend(AFDA2ABackendBase):
 
     name = "mooncake"
 
-    def __init__(self, fd_config, afd_layout: AFDExpertLayout):
+    def __init__(self, fd_config):
         if fd_config.model_config.num_max_dispatch_tokens_per_rank > 1024:
             raise ValueError(
                 "Mooncake AFD requires num_max_dispatch_tokens_per_rank <= 1024, "
@@ -58,24 +53,16 @@ class AFDMooncakeM2NA2ABackend(AFDA2ABackendBase):
 
         self.role = role
         self.top_k = fd_config.model_config.num_experts_per_tok
-        self.active_ranks = paddle.ones((afd_layout.world_size,), dtype=paddle.int32)
+        self.active_ranks = paddle.ones((fd_config.afd_config.afd_world_size,), dtype=paddle.int32)
         self._first_execution = True
         self._timeout_us = 10_000_000
         self.m2n_buffer = M2NBuffer(
             mooncake_group,
-            attention_ranks=afd_layout.afd_world_topology.attn_ranks,
-            ffn_ranks=afd_layout.afd_world_topology.ffn_ranks,
-            num_experts_per_rank=afd_layout.num_local_physical_experts,
+            attention_ranks=fd_config.afd_config.afd_attn_ranks,
+            ffn_ranks=fd_config.afd_config.afd_ffn_ranks,
+            num_experts_per_rank=fd_config.afd_config.afd_num_local_physical_experts,
             num_max_dispatch_tokens_per_rank=fd_config.model_config.num_max_dispatch_tokens_per_rank,
             hidden=fd_config.model_config.hidden_size,
-        )
-        logger.info(
-            "AFD Mooncake M2N backend created: "
-            f"role={self.role}, world_size={afd_layout.world_size}, "
-            f"attn_ranks={afd_layout.afd_world_topology.attn_ranks}, "
-            f"ffn_ranks={afd_layout.afd_world_topology.ffn_ranks}, "
-            f"physical_experts={afd_layout.num_physical_experts}, "
-            f"local_physical_experts={afd_layout.num_local_physical_experts}"
         )
 
     def _get_timeout(self) -> int:
@@ -138,6 +125,3 @@ class AFDMooncakeM2NA2ABackend(AFDA2ABackendBase):
         self._finish(event, hook)
         self._first_execution = False
         return combined
-
-    def runtime_device_info(self):
-        return "mooncake-m2n"
