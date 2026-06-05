@@ -248,6 +248,7 @@ def measure_time(prefix: str = "Model loading"):
 
 
 def load_reordered_experts(model_path: str, key_name: str):
+    import ml_dtypes
     from safetensors import safe_open
 
     with open(os.path.join(model_path, "model.safetensors.index.json"), "r") as f:
@@ -256,7 +257,10 @@ def load_reordered_experts(model_path: str, key_name: str):
     with safe_open(safetensor_path, framework="np", device="cpu") as f:
         if key_name in f.keys():
             weight = f.get_tensor(key_name)
-            weight = paddle.Tensor(weight, zero_copy=True)
+            if weight.dtype == ml_dtypes.bfloat16:
+                weight = paddle.Tensor(weight.view("uint16"), dtype=paddle.bfloat16, zero_copy=True)
+            else:
+                weight = paddle.Tensor(weight, zero_copy=True)
             weight = weight._copy_to(paddle.framework._current_expected_place(), False)
             return weight
 

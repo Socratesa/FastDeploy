@@ -624,6 +624,8 @@ class FusedMoE(nn.Layer):
         else:
             gate_expert_weight_key = up_gate_proj_expert_weight_key.replace("up_gate_proj", "gate_proj")
             up_expert_weight_key = up_gate_proj_expert_weight_key.replace("up_gate_proj", "up_proj")
+            target_up_gate_shape = list(self.up_gate_proj_weight.shape[1:])
+            target_down_shape = list(self.down_proj_weight.shape[1:])
             for expert_idx in logical_expert_ids:
                 gate_expert_weight_key_name = gate_expert_weight_key.format(expert_idx)
                 up_expert_weight_key_name = up_expert_weight_key.format(expert_idx)
@@ -644,17 +646,25 @@ class FusedMoE(nn.Layer):
                     ),
                     self.fd_config.model_config.model,
                 )
-                up_gate_proj_weights.append(paddle.concat([gate, up], axis=-1))
-                down_proj_weights.append(
-                    get_tensor(
-                        (
-                            state_dict.pop(down_proj_expert_weight_key_name)
-                            if down_proj_expert_weight_key_name in state_dict
-                            else down_proj_expert_weight_key_name
-                        ),
-                        self.fd_config.model_config.model,
-                    )
+                down = get_tensor(
+                    (
+                        state_dict.pop(down_proj_expert_weight_key_name)
+                        if down_proj_expert_weight_key_name in state_dict
+                        else down_proj_expert_weight_key_name
+                    ),
+                    self.fd_config.model_config.model,
                 )
+                up_gate = paddle.concat([gate, up], axis=-1)
+                if list(up_gate.shape) != target_up_gate_shape:
+                    transposed_up_gate = paddle.concat([gate.transpose([1, 0]), up.transpose([1, 0])], axis=-1)
+                    if list(transposed_up_gate.shape) == target_up_gate_shape:
+                        up_gate = transposed_up_gate
+                if list(down.shape) != target_down_shape:
+                    transposed_down = down.transpose([1, 0])
+                    if list(transposed_down.shape) == target_down_shape:
+                        down = transposed_down
+                up_gate_proj_weights.append(up_gate)
+                down_proj_weights.append(down)
         return up_gate_proj_weights, down_proj_weights, logical_expert_ids, ep_rank_to_expert_id_list
 
     def extract_moe_ffn_weights(self, state_dict: dict):

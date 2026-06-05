@@ -267,7 +267,7 @@ def rebalance_experts(
     eplb_strategy: str = "",
     fd_config=None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    afd_config = fd_config.afd_config
+    afd_config = fd_config.afd_config if fd_config is not None else None
     if afd_config is None or not afd_config.enable_afd:
         return _rebalance_experts(
             weight,
