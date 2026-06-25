@@ -182,8 +182,8 @@ def init_distributed_environment(seed: int = 20) -> Tuple[int, int]:
     return world_size, global_rank
 
 
-def collect_afd_rank_info(args, world_size: int, global_rank: int) -> Tuple[int, int, List[int], List[int], int]:
-    """Collect per-rank AFD topology and return node start rank and node-local rank."""
+def collect_afd_rank_info(args, world_size: int, global_rank: int) -> Tuple[int, int, List[int], List[int], int, int]:
+    """Collect per-rank AFD topology and return node start rank, node-local rank and ATTN TP size."""
     info = {
         "afd_role": args.afd_role,
         "afd_nnode_rank": args.afd_nnode_rank,
@@ -204,9 +204,17 @@ def collect_afd_rank_info(args, world_size: int, global_rank: int) -> Tuple[int,
     role_map = {}
     attn_ranks = []
     ffn_ranks = []
+    afd_attn_tp_size = None
     for item in infos:
         if item["afd_role"] == "attn":
             attn_ranks.append(item["global_rank"])
+            if afd_attn_tp_size is None:
+                afd_attn_tp_size = item["tp_size"]
+            elif afd_attn_tp_size != item["tp_size"]:
+                raise ValueError(
+                    "AFD requires one ATTN tp_size, "
+                    f"got {afd_attn_tp_size} and {item['tp_size']} from ranks={infos}"
+                )
         elif item["afd_role"] == "ffn":
             ffn_ranks.append(item["global_rank"])
         else:
@@ -260,7 +268,7 @@ def collect_afd_rank_info(args, world_size: int, global_rank: int) -> Tuple[int,
     afd_node_srank = curr_node_ranks[0]
     local_rank = global_rank - afd_node_srank
     ranks = len(curr_node_ranks)
-    return ranks, local_rank, attn_ranks, ffn_ranks, afd_node_srank
+    return ranks, local_rank, attn_ranks, ffn_ranks, afd_node_srank, afd_attn_tp_size
 
 
 def update_fd_config_for_mm(fd_config: FDConfig) -> None:
@@ -1397,6 +1405,7 @@ def initialize_fd_config(
     global_rank: int = 0,
     local_rank: int = 0,
     afd_node_srank: int = 0,
+    afd_attn_tp_size: int = 1,
     afd_attn_ranks: List[int] | None = None,
     afd_ffn_ranks: List[int] | None = None,
 ) -> FDConfig:
@@ -1417,7 +1426,7 @@ def initialize_fd_config(
     cache_config = CacheConfig(vars(args))
     scheduler_config = SchedulerConfig(vars(args))
     eplb_config = EPLBConfig(args.eplb_config)
-    afd_config = AFDConfig(vars(args), afd_node_srank)
+    afd_config = AFDConfig(vars(args), afd_node_srank, afd_attn_tp_size)
     if afd_config.enable_afd:
         afd_config.set_rank_topology(world_size, afd_attn_ranks or [], afd_ffn_ranks or [])
         num_logical_experts = (
@@ -1576,11 +1585,14 @@ def run_worker_proc() -> None:
     local_rank = global_rank
     ranks = world_size
     afd_node_srank = 0
+    afd_attn_tp_size = 1
     attn_ranks = []
     ffn_ranks = []
-    
+
     if args.afd_role is not None:
-        ranks, local_rank, attn_ranks, ffn_ranks, afd_node_srank = collect_afd_rank_info(args, world_size, global_rank)
+        ranks, local_rank, attn_ranks, ffn_ranks, afd_node_srank, afd_attn_tp_size = collect_afd_rank_info(
+            args, world_size, global_rank
+        )
 
     # Get fd_config
     fd_config = initialize_fd_config(
@@ -1590,6 +1602,7 @@ def run_worker_proc() -> None:
         global_rank=global_rank,
         local_rank=local_rank,
         afd_node_srank=afd_node_srank,
+        afd_attn_tp_size=afd_attn_tp_size,
         afd_attn_ranks=attn_ranks,
         afd_ffn_ranks=ffn_ranks,
     )

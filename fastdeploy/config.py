@@ -781,6 +781,7 @@ class AFDConfig:
         self,
         args,
         afd_node_srank: int = 0,
+        afd_attn_tp_size: int = 1,
     ):
         self.afd_role = None
         self.afd_master = None
@@ -792,6 +793,7 @@ class AFDConfig:
         self.afd_world_size: int = 1
         self.afd_num_attn_ranks: int = 0
         self.afd_num_ffn_ranks: int = 0
+        self.afd_attn_tp_size: int = afd_attn_tp_size
         self.afd_num_logical_experts: int = 0
         self.afd_redundant_experts_num: int = 0
         self.afd_num_ffn_physical_experts: int = 0
@@ -832,11 +834,10 @@ class AFDConfig:
                 f"redundant_experts_num={num_redundant_experts}, "
                 f"ffn_ranks={self.afd_ffn_ranks}"
             )
-        
+
         self.afd_num_local_physical_experts = self.afd_num_ffn_physical_experts // self.afd_num_ffn_ranks
         self.afd_num_physical_experts = self.afd_num_local_physical_experts * self.afd_world_size
-        
-        
+
         self.afd_static_log2phy = []
         for logical_id in range(num_logical_experts):
             ffn_rank_index = logical_id // self.afd_num_local_physical_experts
@@ -2293,8 +2294,11 @@ class FDConfig:
                     "Warning: sequence parallel moe do not support max_num_seqs < tensor_parallel_size when cudagraph enabled. We set use_sequence_parallel_moe to False."
                 )
             else:
+                tp_size = self.parallel_config.tensor_parallel_size
+                if self.afd_config is not None and self.afd_config.afd_role == "ffn":
+                    tp_size = self.afd_config.afd_attn_tp_size
                 # It will hang when real batch_size < tp_size
-                self.graph_opt_config.filter_capture_size(tp_size=self.parallel_config.tensor_parallel_size)
+                self.graph_opt_config.filter_capture_size(tp_size=tp_size)
 
         if ErnieArchitectures.is_ernie5_arch(self.model_config.architectures):
             # ernie5 model not support chunked_mm_input
