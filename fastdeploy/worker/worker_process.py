@@ -72,6 +72,7 @@ from fastdeploy.model_executor.utils import v1_loader_support
 from fastdeploy.platforms import current_platform
 from fastdeploy.scheduler import SchedulerConfig
 from fastdeploy.utils import all_gather_values, get_logger, optional_type, get_host_ip
+from fastdeploy.cache_manager.transfer_factory.utils import get_rdma_nics
 from fastdeploy.worker.worker_base import WorkerBase
 
 logger = get_logger("worker_process", "worker_process.log")
@@ -172,11 +173,10 @@ def init_distributed_environment(seed: int = 20) -> Tuple[int, int]:
 
     if envs.FD_USE_MOONCAKE_PG:
         from mooncake.paddle_integration import init_mooncake_pg
-        ib_devices = envs.FD_MOONCAKE_IB_DEVICES.split(",") if envs.FD_MOONCAKE_IB_DEVICES else None
         init_mooncake_pg(
             world_size, global_rank,
             host_ip=get_host_ip(),
-            ib_device_filter=ib_devices,
+            ib_device_filter=get_rdma_nics().split(","),
             clean_existed_groups=True, logger=logger)
 
     return world_size, global_rank
