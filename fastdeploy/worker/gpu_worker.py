@@ -25,6 +25,11 @@ from paddle import nn
 from fastdeploy import envs
 from fastdeploy.config import FDConfig
 from fastdeploy.engine.request import Request
+from fastdeploy.model_executor.layers.moe.expert_stats import (
+    reset_all_expert_stats,
+    save_all_expert_stats,
+    set_expert_stats_recording,
+)
 from fastdeploy.plugins.model_runner import load_model_runner_plugins
 from fastdeploy.usage.usage_lib import report_usage_stats
 from fastdeploy.utils import get_logger, set_random_seed
@@ -233,6 +238,8 @@ class GpuWorker(WorkerBase):
         | Static Full Graph (full=True)     | Dynamic                  | Static + CUDAGraph       |
         | Static Split Graph (full=False)   | Static + CUDAGraph       | Dynamic + CUDAGraph      |
         """
+        # Warmup captures layer inputs but must not contribute statistics.
+        set_expert_stats_recording(False)
         if self.fd_config.graph_opt_config.graph_opt_level >= 1 and not self.model_runner.use_cudagraph:
             self.model_runner.sot_warmup()
         if self.fd_config.graph_opt_config.graph_opt_level >= 1:
@@ -258,9 +265,17 @@ class GpuWorker(WorkerBase):
             set_random_seed(self.fd_config.model_config.seed)
             self.model_runner.share_inputs.reset_share_inputs()
 
+        reset_all_expert_stats()
+        set_expert_stats_recording(True)
+
     def check_health(self) -> bool:
         """ """
         return True
+
+    def save_moe_expert_stats(self):
+        """Persist the TP-rank-zero MoE statistics snapshot."""
+        paths = save_all_expert_stats(raise_on_error=True)
+        return {"rank": self.fd_config.parallel_config.tensor_parallel_rank, "paths": paths}
 
     def cal_theortical_kvcache(self) -> int:
         """Calculate the block memory required"""

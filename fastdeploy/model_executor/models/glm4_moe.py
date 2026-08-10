@@ -43,6 +43,10 @@ from fastdeploy.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from fastdeploy.model_executor.layers.lm_head import ParallelLMHead
+from fastdeploy.model_executor.layers.moe.expert_stats import (
+    begin_all_expert_stats_forward,
+    finish_all_expert_stats_forward,
+)
 from fastdeploy.model_executor.layers.moe.moe import FusedMoE
 from fastdeploy.model_executor.layers.normalization import QKRMSNorm, RMSNorm
 from fastdeploy.model_executor.models.model_base import (
@@ -622,7 +626,9 @@ class Glm4MoeForCausalLM(ModelForCasualLM):
         forward_meta: ForwardMeta,
     ):
         ids_remove_padding = inputs["ids_remove_padding"]
+        begin_all_expert_stats_forward()
         hidden_states = self.model(ids_remove_padding=ids_remove_padding, forward_meta=forward_meta)
+        finish_all_expert_stats_forward(int(ids_remove_padding.shape[0]))
 
         return hidden_states
 
