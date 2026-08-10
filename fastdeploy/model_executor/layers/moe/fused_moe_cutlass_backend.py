@@ -115,6 +115,23 @@ class CutlassMoEMethod(UnquantizedFusedMoEMethod):
             ffn_out_without_down_proj_bias = paddle.add(ffn_out_without_down_proj_bias, down_proj_bias_expand)
         return ffn_out_without_down_proj_bias
 
+    @staticmethod
+    def _stage_tp_stats(layer, x, stats_q, topk_weights, topk_idx):
+        expert_stats = getattr(layer, "expert_stats", None)
+        if expert_stats is None or stats_q is None:
+            return
+        expert_stats.stage_tp(
+            layer_idx=layer.layer_idx,
+            x=x,
+            q=stats_q,
+            topk_weights=topk_weights,
+            topk_indices=topk_idx,
+            forward_meta=getattr(layer, "_forward_meta", None),
+            layer=layer,
+            tp_group=layer.tp_group,
+            expert_method=layer.quant_method,
+        )
+
     def apply_ep_prefill(
         self,
         layer: nn.Layer,
@@ -320,6 +337,9 @@ class CutlassMoEMethod(UnquantizedFusedMoEMethod):
         """
         gate_out = gate(x)
         gate_out = gate_out.cast("float32")
+        # get_moe_scores mutates its score tensor into a sparse top-k buffer;
+        # retain the original sigmoid scores for the all-expert side channel.
+        stats_q = paddle.nn.functional.sigmoid(gate_out) if getattr(layer, "expert_stats", None) is not None else None
         if fastdeploy.envs.FD_USE_PHI_MOE_PERMUTE and self.moe_quant_type == "w16a16":
             if layer.topk_method == "noaux_tc":
                 gate_out, topk_weights, topk_idx = get_moe_scores(
@@ -381,6 +401,7 @@ class CutlassMoEMethod(UnquantizedFusedMoEMethod):
                 num_experts=layer.num_experts,
                 using_weighted_combine=True,
             )
+            self._stage_tp_stats(layer, x, stats_q, topk_weights, topk_idx)
             return fused_moe_out
 
         if layer.topk_method == "noaux_tc":
@@ -470,6 +491,7 @@ class CutlassMoEMethod(UnquantizedFusedMoEMethod):
             norm_topk_prob=False if layer.topk_method == "noaux_tc" else True,
             routed_scaling_factor=1.0,
         )
+        self._stage_tp_stats(layer, x, stats_q, topk_weights, topk_idx)
         return fused_moe_out
 
 

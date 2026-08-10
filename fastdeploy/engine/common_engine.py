@@ -1670,6 +1670,10 @@ class EngineService:
 
         return responses
 
+    def _control_save_moe_expert_stats(self, control_request: ControlRequest):
+        """Ask every model worker to persist its local MoE statistics."""
+        return self._call_worker(control_request, 300)
+
     def _control_abort_requests(self, control_req: ControlRequest):
         if not envs.ENABLE_V1_KVCACHE_SCHEDULER:
             raise Exception("abort_requests only supported in ENABLE_V1_KVCACHE_SCHEDULER")

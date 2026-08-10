@@ -27,6 +27,7 @@ from fastdeploy.distributed.communication import (
     tensor_model_parallel_all_reduce_custom,
 )
 from fastdeploy.model_executor.forward_meta import ForwardMeta
+from fastdeploy.model_executor.layers.moe.expert_stats import get_expert_stats_collector
 from fastdeploy.model_executor.layers.moe.routing_indices_cache import (
     save_routing_to_buffer,
 )
@@ -186,6 +187,8 @@ class FusedMoE(nn.Layer):
 
         self.fd_config = fd_config
         self.layer_idx = layer_idx
+        self.expert_stats = get_expert_stats_collector(fd_config)
+        self._forward_meta = None
         self.reduce_results = reduce_results
         self.renormalize = renormalize
         self.tp_rank = fd_config.parallel_config.tensor_parallel_rank
@@ -759,6 +762,7 @@ class FusedMoE(nn.Layer):
             Tensor: Output tensor.s
 
         """
+        self._forward_meta = forward_meta
         topk_ids_hookfunc = None
         if self.enable_routing_replay:
             # When execute empty_input_forward forward_meta is None. When execute mtp layer routing_replay_table is None.
