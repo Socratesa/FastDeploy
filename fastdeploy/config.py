@@ -782,6 +782,14 @@ class ParallelConfig:
         self.tp_group = dist.new_group(tp_group_ranks, pg_options=pg_opts)
         dist.collective._set_custom_gid(None)
 
+        if not self.enable_expert_parallel:
+            # Worker synchronization paths use ep_group even in pure TP mode.
+            # This has to come after tp_group is created above: doing it in the
+            # `else` branch of the enable_expert_parallel check reads tp_group
+            # before it exists and dies with AttributeError, which is why the
+            # pure-TP path never started.
+            self.ep_group = self.tp_group
+
         if envs.FD_ENABLE_CPU_GROUP:
             backend = "mooncake" if envs.FD_USE_MOONCAKE_PG else "gloo"
             cpu_pg_opts = {**pg_opts, "device": "cpu"} if pg_opts else None

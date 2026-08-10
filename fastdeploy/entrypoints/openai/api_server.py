@@ -502,6 +502,14 @@ async def update_weights(request: Request) -> Response:
     return control_response.to_api_json_response()
 
 
+@app.post("/v1/save_moe_expert_stats")
+async def save_moe_expert_stats(request: Request) -> Response:
+    request_id = f"control-{uuid.uuid4()}"
+    control_request = ControlRequest(request_id, "save_moe_expert_stats")
+    control_response = await app.state.engine_client.run_control_method(control_request)
+    return control_response.to_api_json_response()
+
+
 @app.post("/v1/abort_requests")
 async def abort_requests(request: Request):
     body = await request.json()
