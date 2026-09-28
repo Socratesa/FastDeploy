@@ -390,13 +390,17 @@ elif paddle.is_compiled_with_cuda():
     nvcc_compile_args += ["-DPADDLE_DEV"]
     nvcc_compile_args += ["-DPADDLE_ON_INFERENCE"]
     nvcc_compile_args += ["-DPy_LIMITED_API=0x03090000"]
+    # Absolute paths: ninja runs from build/, so relative -Igpu_ops does not
+    # resolve and #include "helper.h" fails.
+    ops_root = os.path.dirname(os.path.abspath(__file__))
+    gpu_ops_dir = os.path.join(ops_root, "gpu_ops")
     nvcc_compile_args += [
-        "-Igpu_ops/cutlass_kernels",
-        "-Ithird_party/cutlass/include",
-        "-Ithird_party/cutlass/tools/util/include",
-        "-Igpu_ops/fp8_gemm_with_cutlass",
-        "-Igpu_ops",
-        "-Ithird_party/nlohmann_json/include",
+        f"-I{os.path.join(gpu_ops_dir, 'cutlass_kernels')}",
+        f"-I{os.path.join(ops_root, 'third_party/cutlass/include')}",
+        f"-I{os.path.join(ops_root, 'third_party/cutlass/tools/util/include')}",
+        f"-I{os.path.join(gpu_ops_dir, 'fp8_gemm_with_cutlass')}",
+        f"-I{gpu_ops_dir}",
+        f"-I{os.path.join(ops_root, 'third_party/nlohmann_json/include')}",
     ]
     max_jobs, nvcc_threads = get_compile_parallelism()
     print(f"MAX_JOBS = {max_jobs}, nvcc -t = {nvcc_threads}")
@@ -415,6 +419,7 @@ elif paddle.is_compiled_with_cuda():
     cc = max(sm_versions)
     print(f"cc = {cc}")
     fp8_auto_gen_directory = "gpu_ops/cutlass_kernels/fp8_gemm_fused/autogen"
+    fp8_autogen_abs = os.path.join(gpu_ops_dir, "cutlass_kernels/fp8_gemm_fused/autogen")
     if os.path.isdir(fp8_auto_gen_directory):
         shutil.rmtree(fp8_auto_gen_directory)
 
@@ -423,7 +428,7 @@ elif paddle.is_compiled_with_cuda():
         nvcc_compile_args += [
             "-DENABLE_SM75_EXT_OPS",
             "-DENABLE_SCALED_MM_C2X=1",
-            "-Igpu_ops/cutlass_kernels/w8a8",
+            f"-I{os.path.join(gpu_ops_dir, 'cutlass_kernels/w8a8')}",
         ]
         sources += [
             "gpu_ops/cutlass_kernels/w8a8/scaled_mm_entry.cu",
@@ -461,15 +466,18 @@ elif paddle.is_compiled_with_cuda():
         sources += find_end_files("gpu_ops/cutlass_kernels/moe_gemm/", ".cu")
         sources += find_end_files("gpu_ops/cutlass_kernels/w4a8_moe/", ".cu")
         sources += find_end_files("gpu_ops/moe/", ".cu")
-        nvcc_compile_args += ["-Igpu_ops/moe"]
+        nvcc_compile_args += [f"-I{os.path.join(gpu_ops_dir, 'moe')}"]
 
     if cc >= 89:
         # Running generate fp8 gemm codes.
         # Common for SM89, SM90, SM100 (Blackwell)
         nvcc_compile_args += ["-DENABLE_FP8"]
-        nvcc_compile_args += ["-Igpu_ops/cutlass_kernels/fp8_gemm_fused/autogen"]
-        # This script seems general enough for different SM versions, specific templates are chosen by CUTLASS.
-        os.system("python utils/auto_gen_visitor_fp8_gemm_fused_kernels.py")
+        # Generate first, then add the include. The autogen dir is deleted above.
+        ret = os.system("python utils/auto_gen_visitor_fp8_gemm_fused_kernels.py")
+        if ret != 0:
+            raise RuntimeError("auto_gen_visitor_fp8_gemm_fused_kernels.py failed")
+        os.makedirs(fp8_autogen_abs, exist_ok=True)
+        nvcc_compile_args += [f"-I{fp8_autogen_abs}"]
 
         if cc >= 90:  # Hopper and newer
             # SM90 (Hopper) specific auto-generation and flags
@@ -567,7 +575,8 @@ elif paddle.is_compiled_with_cuda():
         name="fastdeploy_ops",
         ext_modules=CUDAExtension(
             sources=sources,
-            extra_compile_args={"cxx": cc_compile_args, "nvcc": nvcc_compile_args},
+            include_dirs=[gpu_ops_dir, fp8_autogen_abs] if cc >= 89 else [gpu_ops_dir],
+            extra_compile_args={"cxx": cc_compile_args + [f"-I{gpu_ops_dir}"], "nvcc": nvcc_compile_args},
             libraries=["cublasLt"],
             extra_link_args=["-lcuda", "-lnvidia-ml"],
         ),
