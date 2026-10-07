@@ -53,6 +53,8 @@ class ExpertStatsCollector:
         shape = [self.num_layers, self.num_experts]
         self.importance_all = paddle.zeros(shape, dtype="float64")
         self.importance_topk = paddle.zeros(shape, dtype="float64")
+        self.gate_all = paddle.zeros(shape, dtype="float64")
+        self.gate_topk = paddle.zeros(shape, dtype="float64")
         self.route_count = paddle.zeros(shape, dtype="int64")
         self.token_count = paddle.zeros([self.num_layers], dtype="int64")
         self.distance_sum = paddle.zeros([self.num_layers, self.num_experts, self.num_experts], dtype="float64")
@@ -64,6 +66,8 @@ class ExpertStatsCollector:
         for tensor in (
             self.importance_all,
             self.importance_topk,
+            self.gate_all,
+            self.gate_topk,
             self.route_count,
             self.token_count,
             self.distance_sum,
@@ -176,6 +180,17 @@ class ExpertStatsCollector:
         g_all = q / paddle.clip(q.sum(axis=-1, keepdim=True), min=1e-20)
         self.token_count[index] += paddle.sum(valid).cast("int64")
         topk_ids = topk_indices.cast("int64")
+
+        # Gate-only statistics. These need no expert evaluation, so accumulate
+        # them once on the full tensors (shapes stay [tokens, experts]/[tokens, k]).
+        valid_col = valid.unsqueeze(-1)
+        self.gate_all[index] += (g_all * valid_col).sum(axis=0).cast("float64")
+        gate_topk_values = topk_weights.cast("float32") * valid_col
+        self._scatter_add(
+            self.gate_topk[index],
+            topk_ids.reshape([-1, 1]),
+            gate_topk_values.reshape([-1]).cast("float64"),
+        )
         # Process one token chunk at a time so long prefills never retain all
         # 128 expert activations simultaneously.
         for start in range(0, int(x.shape[0]), self.token_chunk):
@@ -218,6 +233,8 @@ class ExpertStatsCollector:
         distance_sum = self.distance_sum.numpy()
         importance_all = self.importance_all.numpy()
         importance_topk = self.importance_topk.numpy()
+        gate_all = self.gate_all.numpy()
+        gate_topk = self.gate_topk.numpy()
         return {
             "distance_sum": distance_sum,
             "distance_mean": distance_sum / token_count_safe[:, None, None],
@@ -225,17 +242,23 @@ class ExpertStatsCollector:
             "expert_importance_all_mean": importance_all / token_count_safe[:, None],
             "expert_importance_topk": importance_topk,
             "expert_importance_topk_mean": importance_topk / token_count_safe[:, None],
+            "gate_all": gate_all,
+            "gate_all_mean": gate_all / token_count_safe[:, None],
+            "gate_topk": gate_topk,
+            "gate_topk_mean": gate_topk / token_count_safe[:, None],
             "route_count": self.route_count.numpy(),
             "token_count": token_count,
             "layer_ids": np.arange(self.first_moe_layer, self.first_moe_layer + self.num_layers),
             "num_experts": np.asarray(self.num_experts, dtype=np.int64),
-            "schema_version": np.asarray(2, dtype=np.int64),
+            "schema_version": np.asarray(3, dtype=np.int64),
             "metadata": np.asarray(
                 json.dumps(
                     {
                         "distance": "sum_t ||Expert_i(x_t)-Expert_j(x_t)||_2",
                         "importance_all": "sum_t q_i/sum(q) * ||Expert_i(x_t)||_2",
                         "importance_topk": "sum_t 1[i in TopK] * g_topk_i * ||Expert_i(x_t)||_2",
+                        "gate_all": "sum_t q_i/sum(q)",
+                        "gate_topk": "sum_t 1[i in TopK] * g_topk_i",
                         "correction_bias": "used only for top-k selection",
                         "parallelism": "pure tensor parallel; expert outputs are TP all-reduced",
                         "token_chunk": self.token_chunk,
