@@ -14,6 +14,7 @@
 # limitations under the License.
 """
 
+import os
 from functools import partial
 from typing import Callable, Optional
 
@@ -106,6 +107,16 @@ def get_moe_scores(
         original_routed_scaling_factor = routed_scaling_factor
         renormalize = False
         routed_scaling_factor = 1.0
+
+    # drop: a logical expert whose replicas all sit on a dead FFN rank keeps its
+    # score and the kernel writes topk id -1 (that term contributes nothing).
+    # retopk: push those experts out of the candidate set so the same top-k is
+    # filled with the next live experts.
+    if expert_id_to_ep_rank_array is not None and os.getenv("FD_LOST_EXPERT_MODE", "drop") == "retopk":
+        dead = expert_in_rank_num_list.reshape([-1]) <= 0
+        scores_with_bias = paddle.where(
+            dead, paddle.full_like(scores_with_bias, -1.0e4), scores_with_bias
+        )
 
     if expert_id_to_ep_rank_array is None:
         scores, topk_values, topk_idx = noaux_tc(

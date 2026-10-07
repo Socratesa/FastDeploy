@@ -15,6 +15,7 @@
 """
 
 """redundant expert manager."""
+import os
 import time
 from typing import Tuple
 
@@ -281,7 +282,12 @@ class RedundantExpertManger:
         # Publish refreshed active expert table.
         self.model_active_expert_id_to_ep_rank_array.copy_(active_table, False)
         self.model_active_expert_in_rank_num_list.copy_(active_count, False)
-        logger.info("redundant_expert: refresh active expert table.")
+        lost_per_layer = (active_count <= 0).astype("int32").sum(axis=1).tolist()
+        logger.info(
+            "redundant_expert: refresh active expert table, "
+            f"mode={os.getenv('FD_LOST_EXPERT_MODE', 'drop')}, "
+            f"logical experts with no live replica per layer={lost_per_layer}"
+        )
 
 if __name__ == "__main__":
     print(RedundantExpertManger(64, 2, 8, 8).model_expert_id_to_ep_rank_array)

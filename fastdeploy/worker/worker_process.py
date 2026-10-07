@@ -541,20 +541,28 @@ class PaddleDisWorkerProc:
         )
 
         # Plan over surviving slots only, compacted to survivor order.
-        stats = self.ft_stats
-        assert stats is not None
         phy2log = table_manager.model_ep_rank_to_expert_id_list.numpy()
         slots = np.concatenate([phy2log[:, g * local : (g + 1) * local] for g in survivors], axis=1)
 
-        keep = keep_from_order(stats.order, slots.shape[1])
-        # coverage_repair orders which lost expert to bring back first, so collapse the
-        # domains to the most demanding one.
-        moves, new_slots = coverage_repair(
-            keep, slots, stats.importance.max(axis=0), load.numpy(), len(survivors)
-        )
-        if not moves:
-            logger.info("rank failure needs no expert moves")
-            return
+        # drop / retopk: no importance stats are supplied, so we do not try to pull
+        # the lost experts back onto the survivors. Rebuild the table with the dead
+        # ranks' slots emptied (-1) and keep every survivor's own experts in place;
+        # get_moe_scores then drops (topk id -1) or re-topks the logical experts that
+        # no longer have a live replica. When stats are provided we still plan a
+        # coverage repair that brings the most important lost experts back.
+        stats = self.ft_stats
+        if stats is None:
+            moves, new_slots = [], slots
+        else:
+            keep = keep_from_order(stats.order, slots.shape[1])
+            # coverage_repair orders which lost expert to bring back first, so collapse the
+            # domains to the most demanding one.
+            moves, new_slots = coverage_repair(
+                keep, slots, stats.importance.max(axis=0), load.numpy(), len(survivors)
+            )
+            if not moves:
+                logger.info("rank failure needs no expert moves")
+                return
 
         # Survivors take the new placement, while casualties reserve experts nobody kept.
         phy2log = np.full_like(phy2log, -1)
@@ -572,7 +580,7 @@ class PaddleDisWorkerProc:
             f"losing {len(afd_config.ffn_ranks) - len(survivors)} rank(s)"
         )
 
-        if self.expert_weight_shm is not None:
+        if moves and self.expert_weight_shm is not None:
             wanted = {(layer, expert) for layer, _, expert in moves}
             names = {
                 name
