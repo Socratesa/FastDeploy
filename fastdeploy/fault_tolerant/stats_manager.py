@@ -14,9 +14,11 @@
 # limitations under the License.
 """
 
+import os
+
 import numpy as np
 
-from fastdeploy.fault_tolerant.strategy import evict_order
+from fastdeploy.fault_tolerant.strategy import evict_order, importance_evict_order
 
 
 class FaultTolStatsManager:
@@ -27,18 +29,40 @@ class FaultTolStatsManager:
         self.num_layers = num_layers
         self.num_experts = num_experts
         self.importance, self.similarity = self._load(path, num_layers, num_experts)
-        self.order, _ = evict_order(self.importance, self.similarity)
+        # FD_FT_EVICT_STRATEGY selects how experts are ranked for eviction:
+        #   "similarity" (default): minimise the importance-weighted coverage loss,
+        #       so an expert well covered by a surviving look-alike is cheap to drop.
+        #   "importance": ignore similarity entirely and rank purely by importance,
+        #       keeping the highest-importance experts and giving up the lowest
+        #       (exp4 rebalance). The length-k prefix is the k most expendable.
+        strategy = os.getenv("FD_FT_EVICT_STRATEGY", "similarity")
+        if strategy == "importance":
+            self.order = importance_evict_order(self.importance)
+        else:
+            self.order, _ = evict_order(self.importance, self.similarity)
 
     @staticmethod
     def _load(path, num_layers, num_experts):
-        """-> (importance [D, L, E], similarity [D, L, E, E])."""
+        """-> (importance [D, L, E], similarity [D, L, E, E]).
+
+        ``similarity`` is optional: the importance-only eviction strategy never
+        reads it, so a stats file may ship importance alone and we synthesise a
+        unit-diagonal identity (every expert only stands in for itself).
+        """
         with np.load(path) as f:
-            importance, similarity = f["importance"], f["similarity"]
+            importance = f["importance"]
+            similarity = f["similarity"] if "similarity" in f else None
 
         if importance.ndim != 3 or importance.shape[1:] != (num_layers, num_experts):
             raise ValueError(
                 f"{path}: importance must be [D, {num_layers}, {num_experts}], got {importance.shape}"
             )
+
+        if similarity is None:
+            eye = np.eye(num_experts, dtype=np.float32)
+            similarity = np.broadcast_to(eye, (importance.shape[0], num_layers, num_experts, num_experts)).copy()
+            return importance, similarity
+
         expected = (importance.shape[0], num_layers, num_experts, num_experts)
         if similarity.shape != expected:
             raise ValueError(f"{path}: similarity must be {expected}, got {similarity.shape}")

@@ -279,6 +279,21 @@ class RedundantExpertManger:
         )[:, :, :num_candidates]
         active_count = keep_int.sum(axis=-1).astype("int32")
 
+        # FD_LOST_EXPERT_MODE=replace: instead of leaving a logical expert with no
+        # live replica dead (drop) or re-topking it away (retopk), point its routing
+        # entry at the most similar *surviving* expert, using an offline calib
+        # similarity map. We rewrite the active table here (control plane, once per
+        # failure); the forward kernels only read the static table, so this is
+        # CUDA-graph safe. Many dead experts may map to the same survivor.
+        if os.getenv("FD_LOST_EXPERT_MODE", "drop") == "replace":
+            target = self._replace_target(num_layers, num_experts, active_table.place)
+            iota = paddle.arange(num_experts, dtype="int64").unsqueeze(0).tile([num_layers, 1])
+            dead = active_count <= 0  # [L, E]
+            src = paddle.where(dead, target, iota)  # dead -> survivor, live -> self
+            idx3 = src.unsqueeze(-1).expand([num_layers, num_experts, num_candidates])
+            active_table = paddle.take_along_axis(active_table, idx3, axis=1)
+            active_count = paddle.take_along_axis(active_count, src, axis=1)
+
         # Publish refreshed active expert table.
         self.model_active_expert_id_to_ep_rank_array.copy_(active_table, False)
         self.model_active_expert_in_rank_num_list.copy_(active_count, False)
@@ -288,6 +303,40 @@ class RedundantExpertManger:
             f"mode={os.getenv('FD_LOST_EXPERT_MODE', 'drop')}, "
             f"logical experts with no live replica per layer={lost_per_layer}"
         )
+
+    def _replace_target(self, num_layers: int, num_experts: int, place):
+        """Logical replacement target ``[num_layers, num_experts]`` for replace mode.
+
+        Loads an offline calib-similarity map (npz with ``replace_map``
+        [num_moe_layers, num_experts] and ``layer_ids`` [num_moe_layers], absolute
+        layer indices). For a dead expert the entry is its most similar surviving
+        expert; everywhere else it is identity (live experts and layers absent from
+        the map stay put). Cached after first build.
+        """
+        cached = getattr(self, "_replace_target_cache", None)
+        if cached is not None and tuple(cached.shape) == (num_layers, num_experts):
+            return cached
+        path = os.getenv("FD_REPLACE_MAP_PATH", "")
+        if not path:
+            raise RuntimeError("FD_LOST_EXPERT_MODE=replace requires FD_REPLACE_MAP_PATH to point at a replace-map npz")
+        data = np.load(path)
+        replace_map = np.ascontiguousarray(data["replace_map"]).astype(np.int64)  # [Lm, E]
+        layer_ids = np.ascontiguousarray(data["layer_ids"]).astype(np.int64)      # [Lm]
+        if replace_map.shape[1] != num_experts:
+            raise RuntimeError(
+                f"replace_map experts {replace_map.shape[1]} != num_experts {num_experts} (path={path})"
+            )
+        full = np.tile(np.arange(num_experts, dtype=np.int64), (num_layers, 1))  # identity
+        for row, layer in enumerate(layer_ids):
+            if 0 <= int(layer) < num_layers:
+                full[int(layer)] = replace_map[row]
+        target = paddle.to_tensor(full, dtype="int64", place=place)
+        self._replace_target_cache = target
+        logger.info(
+            f"redundant_expert: loaded replace-map from {path}, "
+            f"covering {len(layer_ids)} moe layers x {num_experts} experts"
+        )
+        return target
 
 if __name__ == "__main__":
     print(RedundantExpertManger(64, 2, 8, 8).model_expert_id_to_ep_rank_array)

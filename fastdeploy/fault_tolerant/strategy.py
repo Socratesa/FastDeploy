@@ -16,7 +16,30 @@
 
 import numpy as np
 
-__all__ = ["evict_order", "keep_from_order", "gpu_imbalance", "coverage_repair"]
+__all__ = ["evict_order", "importance_evict_order", "keep_from_order", "gpu_imbalance", "coverage_repair"]
+
+
+def importance_evict_order(importance: np.ndarray) -> np.ndarray:
+    """Rank experts for eviction by importance alone, ignoring similarity.
+
+    This is the exp4 "rebalance" policy: keep the highest-importance experts and
+    give up the lowest. Importance is summed over domains, then each layer's
+    experts are sorted ascending, so the most expendable (lowest importance) comes
+    first and the length-k prefix is the k experts to drop. This matches the
+    contract of :func:`evict_order` (same return layout and prefix semantics), so
+    every consumer -- ``keep_from_order``, ``reserve_experts`` -- works unchanged.
+
+    Args:
+        importance: [D, L, E] importance score per domain, layer and expert.
+
+    Returns:
+        order: [L, E] int16, experts in the order they should be given up.
+    """
+    if importance.ndim != 3:
+        raise ValueError(f"importance must be [D, L, E], got {importance.shape}")
+    per_layer = importance.astype(np.float64).sum(axis=0)  # [L, E]
+    # Ascending importance: the least important expert is the first to drop.
+    return np.argsort(per_layer, axis=1, kind="stable").astype(np.int16)
 
 
 def evict_order(importance: np.ndarray, similarity: np.ndarray):

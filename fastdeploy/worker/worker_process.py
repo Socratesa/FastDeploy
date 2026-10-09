@@ -569,7 +569,13 @@ class PaddleDisWorkerProc:
         for index, g in enumerate(survivors):
             phy2log[:, g * local : (g + 1) * local] = new_slots[:, index * local : (index + 1) * local]
         max_replicas = table_manager.model_expert_id_to_ep_rank_array.shape[-1]
-        dropped = stats.order[:, : max(0, afd_config.num_logical_experts - slots.shape[1])]
+        # Without importance stats (drop / retopk / replace) there is no ranked list of
+        # lost experts to pull back first, so reserve nothing by importance and let
+        # reserve_experts seed the casualty slots from the hottest live experts.
+        if stats is not None:
+            dropped = stats.order[:, : max(0, afd_config.num_logical_experts - slots.shape[1])]
+        else:
+            dropped = np.empty((phy2log.shape[0], 0), dtype=phy2log.dtype)
         reserve_experts(phy2log, dropped, load.numpy(), casualties, local, max_replicas)
         log2phy, expert_count = derive_expert_tables(phy2log, afd_config.num_logical_experts, max_replicas)
 
