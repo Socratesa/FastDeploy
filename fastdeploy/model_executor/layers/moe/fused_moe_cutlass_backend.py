@@ -136,6 +136,7 @@ class CutlassMoEMethod(UnquantizedFusedMoEMethod):
             layer=layer,
             tp_group=layer.tp_group,
             expert_method=layer.quant_method,
+            residual=getattr(layer, "_easyep_residual", None),
         )
 
     def apply_ep_prefill(

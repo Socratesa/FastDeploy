@@ -357,6 +357,14 @@ class Glm4MoeDecoderLayer(nn.Layer):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual, proxy_rmsnorm=proxy_rmsnorm)
 
+        # EASY-EP side channel: expose the pre-MoE residual stream (h_t) so the
+        # expert-stats collector can weight importance by each token's contribution
+        # c_t = max(1 - cos(h_t, h_t + routed_moe), 0). No-op unless FD_MOE_STATS_ENABLE=1
+        # (expert_stats is None otherwise) and only on MoE layers (dense mlp has no .experts).
+        experts = getattr(self.mlp, "experts", None)
+        if experts is not None and getattr(experts, "expert_stats", None) is not None:
+            experts._easyep_residual = residual
+
         hidden_states = self.mlp(hidden_states, forward_meta)
 
         return hidden_states, residual

@@ -40,6 +40,9 @@ class ExpertStatsCollector:
         self.recording = False
         self.output_path = os.getenv("FD_MOE_STATS_PATH", "moe_expert_stats.npz")
         self.token_chunk = max(1, int(os.getenv("FD_MOE_STATS_TOKEN_CHUNK", "16")))
+        # EASY-EP token-contribution weighting (importance_topk_easyep). On by
+        # default; set FD_MOE_STATS_EASYEP=0 to skip residual staging + cosine.
+        self.easyep_enabled = bool(int(os.getenv("FD_MOE_STATS_EASYEP", "1")))
         self.expert_prefix = paddle.arange(1, self.num_experts + 1, dtype="int64")
         self.distance_mask = 1.0 - paddle.eye(self.num_experts, dtype="float32")
         graph_cfg = fd_config.graph_opt_config
@@ -53,6 +56,10 @@ class ExpertStatsCollector:
         shape = [self.num_layers, self.num_experts]
         self.importance_all = paddle.zeros(shape, dtype="float64")
         self.importance_topk = paddle.zeros(shape, dtype="float64")
+        # EASY-EP: importance_topk reweighted per token by the "token contribution"
+        # c_t = max(1 - cos(h_t, h_t + routed_t), 0) (arXiv:2504.06792).
+        self.importance_topk_easyep = paddle.zeros(shape, dtype="float64")
+        self.contrib_sum = paddle.zeros([self.num_layers], dtype="float64")
         self.gate_all = paddle.zeros(shape, dtype="float64")
         self.gate_topk = paddle.zeros(shape, dtype="float64")
         self.route_count = paddle.zeros(shape, dtype="int64")
@@ -66,6 +73,8 @@ class ExpertStatsCollector:
         for tensor in (
             self.importance_all,
             self.importance_topk,
+            self.importance_topk_easyep,
+            self.contrib_sum,
             self.gate_all,
             self.gate_topk,
             self.route_count,
@@ -104,6 +113,7 @@ class ExpertStatsCollector:
         layer,
         tp_group,
         expert_method,
+        residual: paddle.Tensor = None,
     ):
         index = self._layer_index(layer_idx)
         if index is None or not self.enabled or int(x.shape[0]) == 0:
@@ -117,6 +127,10 @@ class ExpertStatsCollector:
             layer,
             tp_group,
             expert_method,
+            # EASY-EP pre-MoE residual stream (h_t). Snapshot like the others so the
+            # captured buffer is refreshed on cuda-graph replay; None when unavailable
+            # or when EASY-EP weighting is disabled (saves the extra staged tensor).
+            paddle.assign(residual) if (residual is not None and self.easyep_enabled) else None,
         )
 
     def finish_forward(self, actual_rows: int):
@@ -173,6 +187,7 @@ class ExpertStatsCollector:
         layer,
         tp_group,
         expert_method,
+        residual: paddle.Tensor = None,
     ):
         """Evaluate all experts from a staged layer input and accumulate metrics."""
         # q is sigmoid(gate(x)) before correction bias and top-k mutation.
@@ -209,6 +224,32 @@ class ExpertStatsCollector:
                 chunk_ids.reshape([-1, 1]),
                 (chunk_norms * chunk_values).reshape([-1]).cast("float64"),
             )
+
+            # EASY-EP: weight each token's top-k importance by its token
+            # contribution c_t = max(1 - cos(h_t, h_t + routed_t), 0). h_t is the
+            # pre-MoE residual stream; routed_t = sum_j g_j * Expert_j(x_t) (routed
+            # experts only, shared excluded) reconstructed from the all-expert
+            # chunk, so no extra expert evaluation is needed. Falls back to the
+            # unweighted top-k importance accumulation when the residual is absent.
+            if residual is not None and self.easyep_enabled:
+                hidden = int(chunk.shape[-1])
+                gathered = paddle.take_along_axis(
+                    chunk, chunk_ids.unsqueeze(-1).tile([1, 1, hidden]), axis=1
+                )  # [tokens, k, hidden]
+                routed = (gathered * chunk_values.unsqueeze(-1)).sum(axis=1)  # [tokens, hidden]
+                h = residual[start:end].cast("float32")
+                contrib = paddle.clip(
+                    1.0 - paddle.nn.functional.cosine_similarity(h, h + routed, axis=-1),
+                    min=0.0,
+                )  # [tokens]
+                self.contrib_sum[index] += (contrib * chunk_valid).sum().cast("float64")
+                easyep_values = chunk_values * contrib.unsqueeze(-1)
+                self._scatter_add(
+                    self.importance_topk_easyep[index],
+                    chunk_ids.reshape([-1, 1]),
+                    (chunk_norms * easyep_values).reshape([-1]).cast("float64"),
+                )
+
             route_indices = chunk_ids.reshape([-1, 1])
             route_valid = chunk_valid.unsqueeze(-1).tile([1, chunk_ids.shape[1]]).reshape([-1]).cast("int64")
             self._scatter_add(
@@ -233,6 +274,8 @@ class ExpertStatsCollector:
         distance_sum = self.distance_sum.numpy()
         importance_all = self.importance_all.numpy()
         importance_topk = self.importance_topk.numpy()
+        importance_topk_easyep = self.importance_topk_easyep.numpy()
+        contrib_sum = self.contrib_sum.numpy()
         gate_all = self.gate_all.numpy()
         gate_topk = self.gate_topk.numpy()
         return {
@@ -242,6 +285,10 @@ class ExpertStatsCollector:
             "expert_importance_all_mean": importance_all / token_count_safe[:, None],
             "expert_importance_topk": importance_topk,
             "expert_importance_topk_mean": importance_topk / token_count_safe[:, None],
+            "expert_importance_easyep": importance_topk_easyep,
+            "expert_importance_easyep_mean": importance_topk_easyep / token_count_safe[:, None],
+            "token_contribution_sum": contrib_sum,
+            "token_contribution_mean": contrib_sum / token_count_safe,
             "gate_all": gate_all,
             "gate_all_mean": gate_all / token_count_safe[:, None],
             "gate_topk": gate_topk,
@@ -250,13 +297,21 @@ class ExpertStatsCollector:
             "token_count": token_count,
             "layer_ids": np.arange(self.first_moe_layer, self.first_moe_layer + self.num_layers),
             "num_experts": np.asarray(self.num_experts, dtype=np.int64),
-            "schema_version": np.asarray(3, dtype=np.int64),
+            "schema_version": np.asarray(4, dtype=np.int64),
             "metadata": np.asarray(
                 json.dumps(
                     {
                         "distance": "sum_t ||Expert_i(x_t)-Expert_j(x_t)||_2",
                         "importance_all": "sum_t q_i/sum(q) * ||Expert_i(x_t)||_2",
                         "importance_topk": "sum_t 1[i in TopK] * g_topk_i * ||Expert_i(x_t)||_2",
+                        "importance_easyep": (
+                            "sum_t 1[i in TopK] * g_topk_i * ||Expert_i(x_t)||_2 * c_t  "
+                            "(EASY-EP, arXiv:2504.06792)"
+                        ),
+                        "token_contribution": (
+                            "c_t = max(1 - cos(h_t, h_t + routed_t), 0); h_t = pre-MoE residual "
+                            "stream, routed_t = sum_j g_j*Expert_j(x_t) over top-k (shared experts excluded)"
+                        ),
                         "gate_all": "sum_t q_i/sum(q)",
                         "gate_topk": "sum_t 1[i in TopK] * g_topk_i",
                         "correction_bias": "used only for top-k selection",
